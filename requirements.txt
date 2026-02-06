@@ -1,0 +1,54 @@
+# Requirements for TennisComp-Vision-Analysis-System
+# A computer vision system for tennis analysis using YOLO for player/ball detection,
+# court line detection, and player statistics tracking.
+
+# ===== CORE ML / DEEP LEARNING =====
+# PyTorch ecosystem - for neural network models and court line detection
+torch>=1.13.1
+torchvision>=0.14.1
+
+# YOLO object detection - for player and ball tracking
+ultralytics>=8.0.0
+
+# ===== COMPUTER VISION / IMAGE PROCESSING =====
+# OpenCV - main library for video/image I/O and processing
+opencv-python>=4.6.0
+
+# NumPy - fundamental array operations
+numpy>=1.23.0
+
+# PIL/Pillow - image processing (used by torchvision transforms)
+Pillow>=7.1.2
+
+# ===== DATA ANALYSIS / VISUALIZATION =====
+# Pandas - data manipulation and statistics tracking
+pandas>=1.5.0
+
+# Matplotlib - plotting and visualization (used in analysis notebooks)
+matplotlib>=3.6.0
+
+# ===== UTILITIES =====
+# Progress bars for training/processing
+tqdm>=4.64.0
+
+# YAML configuration files
+PyYAML>=6.0
+
+# ===== DEVELOPMENT / TRAINING DEPENDENCIES =====
+# For notebook-based training and experimentation
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# For model serialization
+pickle-mixin>=1.0.2
+
+# ===== OPTIONAL TRAINING DEPENDENCIES =====
+# Uncomment these if you plan to use Roboflow for dataset management
+# roboflow>=1.0.0
+# python-dotenv>=0.19.0
+# requests>=2.25.0
+# requests-toolbelt>=0.9.0
+
+# Uncomment for additional ML capabilities
+# scikit-learn>=1.1.0
+# scikit-image>=0.20.0

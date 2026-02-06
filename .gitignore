@@ -1,0 +1,19 @@
+__pycache__/
+
+# Large model files
+models/best.pt
+models/yolov8x.pt
+models/keypoints_model.pth
+models/weights/
+*.pt
+*.pth
+
+# Output videos (large files)
+output_videos/*.mp4
+output_videos/*.avi
+
+# Input videos (large files)
+inputs/*.mp4
+
+# Git pack files
+.git/objects/pack/
