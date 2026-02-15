@@ -127,6 +127,101 @@ class TrackNet(nn.Module):
         return x
 
 
+class Conv1DBlock(nn.Module):
+    """1D convolution block for InpaintNet"""
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding='same')
+
+    def forward(self, x):
+        return F.relu(self.conv(x))
+
+
+class Bottleneck1D(nn.Module):
+    """Bottleneck with named conv layers for weight compatibility"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv_1 = Conv1DBlock(in_ch, out_ch)
+        self.conv_2 = Conv1DBlock(out_ch, out_ch)
+
+    def forward(self, x):
+        x = self.conv_1(x)
+        x = self.conv_2(x)
+        return x
+
+
+class InpaintNet(nn.Module):
+    """
+    InpaintNet: 1D U-Net for trajectory inpainting.
+
+    Takes ball trajectory coordinates and fills in missing positions.
+    Input: (batch, 3, seq_len) where 3 = (x, y, visibility)
+    Output: (batch, 2, seq_len) where 2 = (x, y) predicted
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Encoder
+        self.down_1 = Conv1DBlock(3, 32)
+        self.down_2 = Conv1DBlock(32, 64)
+        self.down_3 = Conv1DBlock(64, 128)
+
+        # Bottleneck (with named layers to match weights)
+        self.buttleneck = Bottleneck1D(128, 256)
+
+        # Decoder with skip connections
+        self.up_1 = Conv1DBlock(256 + 128, 128)
+        self.up_2 = Conv1DBlock(128 + 64, 64)
+        self.up_3 = Conv1DBlock(64 + 32, 32)
+
+        # Output
+        self.predictor = nn.Conv1d(32, 2, kernel_size=3, padding='same')
+
+    def forward(self, x):
+        # Encoder
+        x1 = self.down_1(x)
+        x2 = self.down_2(x1)
+        x3 = self.down_3(x2)
+
+        # Bottleneck
+        x = self.buttleneck(x3)
+
+        # Decoder with skip connections
+        x = torch.cat([x, x3], dim=1)
+        x = self.up_1(x)
+
+        x = torch.cat([x, x2], dim=1)
+        x = self.up_2(x)
+
+        x = torch.cat([x, x1], dim=1)
+        x = self.up_3(x)
+
+        # Output
+        x = self.predictor(x)
+        return x
+
+
+def load_inpaintnet(weights_path, device='cpu'):
+    """Load InpaintNet model with pretrained weights."""
+    model = InpaintNet()
+
+    checkpoint = torch.load(weights_path, map_location=device)
+
+    if 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+
+    model.load_state_dict(state_dict, strict=True)
+    model = model.to(device)
+    model.eval()
+
+    return model
+
+
 def load_tracknet(weights_path, device='cpu'):
     """
     Load TrackNet model with pretrained weights.

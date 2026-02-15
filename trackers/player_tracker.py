@@ -33,6 +33,8 @@ class PlayerTracker:
         # For temporal consistency - track last known positions
         self.last_positions = {}  # {player_id: (center_x, center_y)}
         self.frames_since_seen = {}  # {player_id: count}
+        # ByteTrack ID to player ID mapping
+        self.track_to_player = {}  # {bytetrack_id: player_id (1-4)}
 
     def point_in_court(self, x, y, frame_width, frame_height):
         """Check if a point is inside the court polygon"""
@@ -82,6 +84,9 @@ class PlayerTracker:
         # Reset tracking state for new detection run
         self.last_positions = {}
         self.frames_since_seen = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.track_to_player = {}  # Reset ByteTrack ID mapping
+        # Reset YOLO tracker state
+        self.model.predictor = None
 
         for frame in frames:
             player_dict = self.detect_frame(frame)
@@ -98,20 +103,26 @@ class PlayerTracker:
         return player_detections
 
     def detect_frame(self, frame, court_bounds=None):
-        """Detect up to 4 players and assign IDs with temporal consistency"""
-        results = self.model.predict(frame, verbose=False)[0]
+        """Detect up to 4 players using ByteTrack for consistent tracking"""
+        # Use ByteTrack for tracking - persist=True maintains track IDs across frames
+        results = self.model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
         id_name_dict = results.names
 
         frame_height, frame_width = frame.shape[:2]
         mid_y = frame_height * 0.5
 
-        # Collect all valid player detections with confidence
+        # Collect all valid player detections with ByteTrack IDs
         candidates = []
         for box in results.boxes:
             result = box.xyxy.tolist()[0]
             object_cls_id = box.cls.tolist()[0]
             object_cls_name = id_name_dict[object_cls_id]
             conf = box.conf.tolist()[0] if hasattr(box, 'conf') else 0.5
+
+            # Get ByteTrack ID (if available)
+            track_id = None
+            if box.id is not None:
+                track_id = int(box.id.tolist()[0])
 
             if object_cls_name == "person":
                 x1, y1, x2, y2 = result
@@ -148,85 +159,79 @@ class PlayerTracker:
                         'center_y': center_y,
                         'bbox': result,
                         'conf': conf,
-                        'height': bbox_height
+                        'height': bbox_height,
+                        'track_id': track_id
                     })
 
-        # Sort by confidence
+        # Sort by confidence and keep top 4
         candidates.sort(key=lambda x: x['conf'], reverse=True)
-        candidates = candidates[:4]  # Keep top 4
+        candidates = candidates[:4]
 
         player_dict = {}
 
-        # TEMPORAL CONSISTENCY: If we have previous positions, match by proximity
-        if self.last_positions and len(candidates) >= 2:
-            used_candidates = set()
-            max_distance = frame_width * 0.15  # Max movement between frames
+        # Check if we have established mappings from ByteTrack IDs to player IDs
+        if self.track_to_player:
+            # Use existing ByteTrack ID -> Player ID mapping
+            for c in candidates:
+                track_id = c['track_id']
+                if track_id is not None and track_id in self.track_to_player:
+                    player_id = self.track_to_player[track_id]
+                    player_dict[player_id] = c['bbox']
 
-            # Match each known player to nearest candidate
-            for player_id in [1, 2, 3, 4]:
-                if player_id not in self.last_positions:
-                    continue
-
-                last_pos = self.last_positions[player_id]
-                best_dist = float('inf')
-                best_idx = -1
-
-                for idx, c in enumerate(candidates):
-                    if idx in used_candidates:
-                        continue
-
-                    # Check team constraint: P1,P2 should stay in bottom, P3,P4 in top
-                    if player_id in [1, 2] and c['center_y'] < mid_y * 0.7:
-                        continue  # Skip if Team 1 player detected too far up
-                    if player_id in [3, 4] and c['center_y'] > mid_y * 1.3:
-                        continue  # Skip if Team 2 player detected too far down
-
-                    dist = measure_distance((c['center_x'], c['center_y']), last_pos)
-                    if dist < best_dist and dist < max_distance:
-                        best_dist = dist
-                        best_idx = idx
-
-                if best_idx >= 0:
-                    player_dict[player_id] = candidates[best_idx]['bbox']
-                    used_candidates.add(best_idx)
-                    self.frames_since_seen[player_id] = 0
-
-            # Assign remaining candidates using position-based logic
-            remaining = [c for idx, c in enumerate(candidates) if idx not in used_candidates]
+            # Handle new track IDs (player re-entered or new detection)
+            unmapped = [c for c in candidates if c['track_id'] not in self.track_to_player or c['track_id'] is None]
             unassigned_ids = [pid for pid in [1, 2, 3, 4] if pid not in player_dict]
 
-            if remaining and unassigned_ids:
-                # Split remaining by court half
-                for c in remaining:
-                    if c['center_y'] >= mid_y:  # Bottom half = Team 1
-                        for pid in [1, 2]:
-                            if pid in unassigned_ids:
-                                player_dict[pid] = c['bbox']
-                                unassigned_ids.remove(pid)
-                                break
-                    else:  # Top half = Team 2
-                        for pid in [3, 4]:
-                            if pid in unassigned_ids:
-                                player_dict[pid] = c['bbox']
-                                unassigned_ids.remove(pid)
-                                break
-
+            for c in unmapped:
+                if not unassigned_ids:
+                    break
+                # Assign based on court position
+                if c['center_y'] >= mid_y:  # Bottom half = Team 1
+                    for pid in [1, 2]:
+                        if pid in unassigned_ids:
+                            player_dict[pid] = c['bbox']
+                            if c['track_id'] is not None:
+                                self.track_to_player[c['track_id']] = pid
+                            unassigned_ids.remove(pid)
+                            break
+                else:  # Top half = Team 2
+                    for pid in [3, 4]:
+                        if pid in unassigned_ids:
+                            player_dict[pid] = c['bbox']
+                            if c['track_id'] is not None:
+                                self.track_to_player[c['track_id']] = pid
+                            unassigned_ids.remove(pid)
+                            break
         else:
-            # INITIAL ASSIGNMENT: First frame or no previous data
+            # INITIAL ASSIGNMENT: First frame - establish ByteTrack ID to Player ID mapping
             if len(candidates) >= 4:
+                # Sort by Y to split into teams
                 candidates.sort(key=lambda x: x['center_y'])
-                team2_players = candidates[:2]
-                team1_players = candidates[-2:]
+                team2_players = candidates[:2]  # Top (far side)
+                team1_players = candidates[-2:]  # Bottom (near side)
 
+                # Sort each team by X position (left to right)
                 team1_players.sort(key=lambda x: x['center_x'])
                 team2_players.sort(key=lambda x: x['center_x'])
 
+                # Assign player IDs and create mapping
                 player_dict[1] = team1_players[0]['bbox']
                 player_dict[2] = team1_players[1]['bbox']
                 player_dict[3] = team2_players[0]['bbox']
                 player_dict[4] = team2_players[1]['bbox']
 
+                # Map ByteTrack IDs to player IDs
+                if team1_players[0]['track_id'] is not None:
+                    self.track_to_player[team1_players[0]['track_id']] = 1
+                if team1_players[1]['track_id'] is not None:
+                    self.track_to_player[team1_players[1]['track_id']] = 2
+                if team2_players[0]['track_id'] is not None:
+                    self.track_to_player[team2_players[0]['track_id']] = 3
+                if team2_players[1]['track_id'] is not None:
+                    self.track_to_player[team2_players[1]['track_id']] = 4
+
             elif len(candidates) >= 2:
+                # Partial detection - assign what we can
                 candidates.sort(key=lambda x: x['center_y'])
                 bottom = [c for c in candidates if c['center_y'] >= mid_y]
                 top = [c for c in candidates if c['center_y'] < mid_y]
@@ -235,15 +240,27 @@ class PlayerTracker:
                     bottom.sort(key=lambda x: x['center_x'])
                     player_dict[1] = bottom[0]['bbox']
                     player_dict[2] = bottom[1]['bbox']
+                    if bottom[0]['track_id'] is not None:
+                        self.track_to_player[bottom[0]['track_id']] = 1
+                    if bottom[1]['track_id'] is not None:
+                        self.track_to_player[bottom[1]['track_id']] = 2
                 elif len(bottom) == 1:
                     player_dict[1] = bottom[0]['bbox']
+                    if bottom[0]['track_id'] is not None:
+                        self.track_to_player[bottom[0]['track_id']] = 1
 
                 if len(top) >= 2:
                     top.sort(key=lambda x: x['center_x'])
                     player_dict[3] = top[0]['bbox']
                     player_dict[4] = top[1]['bbox']
+                    if top[0]['track_id'] is not None:
+                        self.track_to_player[top[0]['track_id']] = 3
+                    if top[1]['track_id'] is not None:
+                        self.track_to_player[top[1]['track_id']] = 4
                 elif len(top) == 1:
                     player_dict[3] = top[0]['bbox']
+                    if top[0]['track_id'] is not None:
+                        self.track_to_player[top[0]['track_id']] = 3
 
         # Update last known positions
         for player_id, bbox in player_dict.items():

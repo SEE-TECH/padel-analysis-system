@@ -94,8 +94,8 @@ class TrackNetBallTracker:
         self.bg_frames_for_median = []
         self.bg_frames_needed = 30  # Frames to compute median
 
-        # Detection threshold
-        self.threshold = 0.5
+        # Detection threshold (30 on 0-255 scale)
+        self.threshold = 30/255
 
     def _load_model(self, model_path):
         """Load TrackNet model with weights"""
@@ -225,29 +225,148 @@ class TrackNetBallTracker:
         return ball_detections
 
     def interpolate_ball_positions(self, ball_positions):
-        """Interpolate missing ball positions with outlier filtering"""
-        # First pass: extract positions and filter outliers (sudden jumps)
+        """Interpolate missing ball positions with outlier filtering and smoothing"""
+        # First pass: extract positions and filter obvious outliers (bounds only)
         ball_positions_filtered = self._filter_ball_outliers(ball_positions)
+
+        # Second pass: filter "stuck" detections (false positives that stay in same place)
+        ball_positions_filtered = self._filter_stuck_detections(ball_positions_filtered)
 
         # Convert to DataFrame for interpolation
         positions = [x.get(1, []) for x in ball_positions_filtered]
         df = pd.DataFrame(positions, columns=['x1', 'y1', 'x2', 'y2'])
+
+        # Calculate center positions for smoothing
+        df['cx'] = (df['x1'] + df['x2']) / 2
+        df['cy'] = (df['y1'] + df['y2']) / 2
+
+        # Apply median filter to remove spikes (window of 5)
+        for col in ['cx', 'cy']:
+            valid_mask = df[col].notna()
+            if valid_mask.sum() > 5:
+                df.loc[valid_mask, col] = df.loc[valid_mask, col].rolling(
+                    window=5, center=True, min_periods=1).median()
 
         # Interpolate missing values
         df = df.interpolate(method='linear', limit_direction='both')
         df = df.bfill()
         df = df.ffill()
 
-        ball_positions = [{1: x} for x in df.to_numpy().tolist()]
+        # Reconstruct bbox from smoothed centers
+        # Assume fixed ball size of 20x20
+        ball_size = 10
+        df['x1'] = df['cx'] - ball_size
+        df['y1'] = df['cy'] - ball_size
+        df['x2'] = df['cx'] + ball_size
+        df['y2'] = df['cy'] + ball_size
+
+        ball_positions = [{1: x} for x in df[['x1', 'y1', 'x2', 'y2']].to_numpy().tolist()]
         return ball_positions
 
-    def _filter_ball_outliers(self, ball_positions):
-        """Filter out sudden jumps in ball position (false positives)"""
-        max_distance_per_frame = 120  # Maximum pixels ball can move per frame
-        max_absolute_distance = 400   # Hard cap on distance regardless of missing frames
-        min_consecutive_frames = 3    # Need 3+ consistent frames to trust position
+    def _filter_stuck_detections(self, ball_positions):
+        """Filter out false positives where ball appears 'stuck' in one position.
 
-        # First pass: basic distance filtering
+        Real ball should be moving during play. If detections stay in roughly
+        the same position for too many consecutive frames, they're likely false positives.
+        """
+        stuck_threshold = 20  # Max movement (pixels) to consider "stuck"
+        min_stuck_frames = 3  # Reduced from 5 - catch stuck regions earlier
+
+        # Extract positions
+        positions = []
+        for i, bp in enumerate(ball_positions):
+            if 1 in bp and bp[1]:
+                bbox = bp[1]
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                positions.append((i, cx, cy))
+            else:
+                positions.append((i, None, None))
+
+        # Find stuck sequences
+        stuck_indices = set()
+        i = 0
+        while i < len(positions):
+            if positions[i][1] is None:
+                i += 1
+                continue
+
+            # Start of a potential stuck sequence
+            start_idx = i
+            start_x, start_y = positions[i][1], positions[i][2]
+            sequence = [positions[i][0]]
+
+            # Look for consecutive frames near this position
+            j = i + 1
+            while j < len(positions):
+                if positions[j][1] is None:
+                    j += 1
+                    continue
+
+                # Check distance from start position
+                dist = ((positions[j][1] - start_x)**2 + (positions[j][2] - start_y)**2)**0.5
+
+                if dist < stuck_threshold:
+                    sequence.append(positions[j][0])
+                    j += 1
+                else:
+                    break
+
+            # If sequence is too long, mark as stuck (false positive)
+            if len(sequence) >= min_stuck_frames:
+                # Check if there are moving detections before/after this stuck region
+                # to confirm it's a false positive (ball should be moving)
+                has_movement_context = False
+
+                # Check frames before
+                for k in range(start_idx - 1, max(0, start_idx - 10), -1):
+                    if positions[k][1] is not None:
+                        dist_before = ((positions[k][1] - start_x)**2 + (positions[k][2] - start_y)**2)**0.5
+                        if dist_before > stuck_threshold * 3:
+                            has_movement_context = True
+                            break
+
+                # Check frames after
+                if not has_movement_context:
+                    for k in range(j, min(len(positions), j + 10)):
+                        if positions[k][1] is not None:
+                            dist_after = ((positions[k][1] - start_x)**2 + (positions[k][2] - start_y)**2)**0.5
+                            if dist_after > stuck_threshold * 3:
+                                has_movement_context = True
+                                break
+
+                # Only filter if there's movement context (confirms ball should be moving)
+                if has_movement_context:
+                    stuck_indices.update(sequence)
+
+            i = j if j > i + 1 else i + 1
+
+        # Remove stuck detections
+        filtered = []
+        for i, bp in enumerate(ball_positions):
+            if i in stuck_indices:
+                filtered.append({})
+            else:
+                filtered.append(bp)
+
+        if stuck_indices:
+            print(f"Filtered {len(stuck_indices)} stuck/false positive frames")
+
+        return filtered
+
+    def _filter_ball_outliers(self, ball_positions):
+        """Filter out obvious outliers (screen edges, extreme bounds)"""
+        # Tighter parameters for more aggressive filtering
+        max_distance_per_frame = 100  # Reduced from 150 - ball shouldn't move too fast
+        max_absolute_distance = 300   # Reduced from 500
+        min_consecutive_frames = 2
+
+        # Court bounds (approximate for 1920x1080 padel broadcast)
+        # Tighter bounds to filter edge detections
+        min_x, max_x = 150, 1770  # Tighter bounds
+        min_y, max_y = 50, 950    # Tighter bounds
+
+        # First pass: basic distance filtering with bounds check
         filtered = []
         last_valid_pos = None
         last_valid_velocity = (0, 0)
@@ -262,6 +381,12 @@ class TrackNetBallTracker:
             bbox = bp[1]
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
+
+            # Bounds check - reject detections outside court area
+            if cx < min_x or cx > max_x or cy < min_y or cy > max_y:
+                filtered.append({})
+                consecutive_count = 0
+                continue
 
             if last_valid_pos is None:
                 # First detection
@@ -313,7 +438,7 @@ class TrackNetBallTracker:
         # Second pass: remove isolated detections (single frame spikes)
         # A valid detection should have at least one neighbor within reasonable distance
         second_pass = []
-        neighbor_max_dist = 150
+        neighbor_max_dist = 80  # Reduced from 150 - neighbors should be close
 
         for i, bp in enumerate(filtered):
             if 1 not in bp or not bp[1]:
@@ -349,8 +474,8 @@ class TrackNetBallTracker:
         # If a detection appears after many missing frames, check if it fits
         # between earlier and later detections
         final_filtered = []
-        gap_threshold = 10  # Consider this a significant gap
-        cluster_skip_dist = 100  # Skip nearby positions to avoid cluster self-validation
+        gap_threshold = 5   # Reduced from 10 - check consistency more often
+        cluster_skip_dist = 60  # Reduced from 100 - tighter cluster detection
 
         for i, bp in enumerate(second_pass):
             if 1 not in bp or not bp[1]:
@@ -403,12 +528,50 @@ class TrackNetBallTracker:
                 interp_dist = ((cx - expected_x)**2 + (cy - expected_y)**2)**0.5
 
                 # If current position is far from interpolated path, reject it
-                max_deviation = 150  # Maximum allowed deviation from interpolated path
+                max_deviation = 80  # Reduced from 150 - tighter trajectory check
                 if interp_dist > max_deviation:
                     final_filtered.append({})
                     continue
 
             final_filtered.append(bp)
+
+        # Fourth pass: statistical z-score based velocity outlier detection
+        # Remove points where velocity is statistically abnormal
+        velocities = []
+        for i in range(1, len(final_filtered)):
+            if 1 in final_filtered[i] and final_filtered[i][1] and \
+               1 in final_filtered[i-1] and final_filtered[i-1][1]:
+                curr_bbox = final_filtered[i][1]
+                prev_bbox = final_filtered[i-1][1]
+                cx = (curr_bbox[0] + curr_bbox[2]) / 2
+                cy = (curr_bbox[1] + curr_bbox[3]) / 2
+                px = (prev_bbox[0] + prev_bbox[2]) / 2
+                py = (prev_bbox[1] + prev_bbox[3]) / 2
+                vel = ((cx - px)**2 + (cy - py)**2)**0.5
+                velocities.append((i, vel))
+
+        if len(velocities) > 10:
+            vel_values = [v[1] for v in velocities]
+            mean_vel = np.mean(vel_values)
+            std_vel = np.std(vel_values)
+            z_threshold = 3.0  # Remove points with velocity > 3 std deviations
+
+            zscore_outliers = set()
+            for idx, vel in velocities:
+                if std_vel > 0:
+                    z = abs(vel - mean_vel) / std_vel
+                    if z > z_threshold:
+                        zscore_outliers.add(idx)
+
+            if zscore_outliers:
+                print(f"Z-score filter removed {len(zscore_outliers)} velocity outliers")
+                statistical_filtered = []
+                for i, bp in enumerate(final_filtered):
+                    if i in zscore_outliers:
+                        statistical_filtered.append({})
+                    else:
+                        statistical_filtered.append(bp)
+                return statistical_filtered
 
         return final_filtered
 

@@ -1,55 +1,19 @@
 """
-Player Best Shots Highlights Video Generator
-
-Creates a highlight reel showing only the player's BEST/FASTEST shots
-with speed display and ball trajectory projection.
+Player Highlights Generator
+Creates highlight videos for specific players with professional intro slides
 """
-
 import cv2
 import numpy as np
-import pickle
 import os
+import pickle
 from ultralytics import YOLO
 import pandas as pd
 
-from utils import read_video, save_video, measure_distance, convert_pixel_distance_to_meters
-from trackers import PlayerTracker
-from trackers.tracknet_ball_tracker import TrackNetBallTracker
-from court_line_detector import PadelCourtDetectorColor
-from mini_court import MiniCourt
-import constants
+from utils import read_video, save_video
 
 # ============================================================================
-# CONFIGURATION
+# POSE AND SKELETON SETTINGS
 # ============================================================================
-HIGHLIGHT_PLAYER = 3  # Player to create highlights for
-TOP_N_SHOTS = 3  # Number of best shots to show (fastest)
-
-VIDEO_CONFIGS = [
-    {
-        'video_path': 'inputs/video_1.mp4',
-        'shot_data_path': 'shot_data_video_1.csv',
-        'sides_switched': False,
-        'description': 'Point 1',
-    },
-    {
-        'video_path': 'inputs/video_3.mp4',
-        'shot_data_path': 'shot_data_video_3.csv',
-        'sides_switched': True,
-        'description': 'Point 2 - Winning Point',
-        'is_scoring_point': True,
-    },
-]
-
-# Player colors
-PLAYER_COLORS = {
-    1: (0, 255, 0),
-    2: (0, 200, 100),
-    3: (0, 0, 255),
-    4: (0, 100, 255),
-}
-
-# Pose settings (same as original algorithm)
 PART_COLORS = {
     'head': (50, 50, 255),
     'eye': (0, 255, 255),
@@ -85,15 +49,306 @@ def get_skeleton_part(idx):
     return 'torso'
 
 
+# Cache for loaded images and scaled versions
+_image_cache = {}
+_scaled_cache = {}
+
+
+def _load_resource_image(name):
+    """Load and cache images from resources folder"""
+    global _image_cache
+    if name not in _image_cache:
+        img_path = os.path.join(os.path.dirname(__file__), 'resources', f'{name}.png')
+        if os.path.exists(img_path):
+            _image_cache[name] = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+        else:
+            _image_cache[name] = None
+    return _image_cache[name]
+
+
+def _get_scaled_image(name, target_width, target_height):
+    """Get a cached scaled version of an image"""
+    global _scaled_cache
+    cache_key = f"{name}_{target_width}_{target_height}"
+    if cache_key not in _scaled_cache:
+        img = _load_resource_image(name)
+        if img is not None:
+            _scaled_cache[cache_key] = cv2.resize(img, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        else:
+            _scaled_cache[cache_key] = None
+    return _scaled_cache[cache_key]
+
+
+def _get_rotated_ball(ball_size, rotation_angle=15):
+    """Get a cached rotated ball image"""
+    global _scaled_cache
+    cache_key = f"BALL_rotated_{ball_size}_{rotation_angle}"
+    if cache_key not in _scaled_cache:
+        ball_img = _load_resource_image('BALL')
+        if ball_img is not None:
+            ball_scaled = cv2.resize(ball_img, (ball_size, ball_size), interpolation=cv2.INTER_AREA)
+            # Create larger canvas for rotation
+            canvas_size = int(ball_size * 1.5)
+            ball_canvas = np.zeros((canvas_size, canvas_size, 4), dtype=np.uint8)
+            offset = (canvas_size - ball_size) // 2
+            ball_canvas[offset:offset+ball_size, offset:offset+ball_size] = ball_scaled
+            # Rotate
+            canvas_center = (canvas_size // 2, canvas_size // 2)
+            rot_matrix = cv2.getRotationMatrix2D(canvas_center, rotation_angle, 1.0)
+            ball_rotated = cv2.warpAffine(ball_canvas, rot_matrix, (canvas_size, canvas_size),
+                                          flags=cv2.INTER_LINEAR,
+                                          borderMode=cv2.BORDER_CONSTANT,
+                                          borderValue=(0, 0, 0, 0))
+            _scaled_cache[cache_key] = (ball_rotated, canvas_size)
+        else:
+            _scaled_cache[cache_key] = (None, 0)
+    return _scaled_cache[cache_key]
+
+
+def _blend_image_onto_frame(frame, img, place_x, place_y, alpha=1.0):
+    """Helper to blend an RGBA image onto a frame using fast NumPy operations"""
+    frame_h, frame_w = frame.shape[:2]
+    img_h, img_w = img.shape[:2]
+
+    # Calculate the valid region (clipping to frame bounds)
+    src_x1 = max(0, -place_x)
+    src_y1 = max(0, -place_y)
+    src_x2 = min(img_w, frame_w - place_x)
+    src_y2 = min(img_h, frame_h - place_y)
+
+    dst_x1 = max(0, place_x)
+    dst_y1 = max(0, place_y)
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+    if src_x2 <= src_x1 or src_y2 <= src_y1:
+        return  # Nothing to blend
+
+    # Extract regions
+    img_region = img[src_y1:src_y2, src_x1:src_x2]
+
+    # Calculate alpha channel
+    if img.shape[2] == 4:
+        img_alpha = img_region[:, :, 3:4].astype(np.float32) / 255.0 * alpha
+    else:
+        img_alpha = np.full((src_y2-src_y1, src_x2-src_x1, 1), alpha, dtype=np.float32)
+
+    # Direct blending into frame (faster than masked assignment)
+    frame[dst_y1:dst_y2, dst_x1:dst_x2] = (
+        frame[dst_y1:dst_y2, dst_x1:dst_x2].astype(np.float32) * (1 - img_alpha) +
+        img_region[:, :, :3].astype(np.float32) * img_alpha
+    ).astype(np.uint8)
+
+
+def draw_diagonal_banner(frame, text, progress, banner_color=(180, 80, 220),
+                         text_color=(255, 255, 255), phase='enter'):
+    """
+    Draw a diagonal banner with animated transitions.
+
+    Phases:
+    - 'enter': Purple banner enters with SMASH text
+    - 'stay': SMASH shown
+    - 'ball_transition': Ball flies through, clears text, transitions to fire bar
+    - 'stay_fire': Fire bar with FIREBALL text
+    - 'exit': Fire bar exits
+
+    Args:
+        frame: The frame to draw on
+        text: Text to display (used for enter/stay phases)
+        progress: Animation progress 0.0 to 1.0 within current phase
+        phase: Animation phase
+
+    Returns:
+        Frame with banner drawn
+    """
+    frame_h, frame_w = frame.shape[:2]
+
+    # Calculate target dimensions
+    target_width = frame_w * 2 // 3
+    purple_bar = _load_resource_image('PURPLE BAR')
+    if purple_bar is None:
+        return frame
+    orig_h, orig_w = purple_bar.shape[:2]
+    scale = target_width / orig_w
+    target_height = int(orig_h * scale)
+
+    # Get cached scaled images (avoids resizing every frame)
+    purple_scaled = _get_scaled_image('PURPLE BAR', target_width, target_height)
+    fire_scaled = _get_scaled_image('FIRE BAR', target_width, target_height)
+
+    # Center position (where banner stays) - left edge aligned
+    center_x = target_width // 2 - 150
+    center_y = frame_h // 3
+
+    # Calculate position and what to show based on phase
+    if phase == 'enter':
+        # Enter from bottom-left corner
+        start_x = -target_width
+        start_y = frame_h + 100
+        eased = 1 - (1 - progress) ** 3
+        current_x = int(start_x + (center_x - start_x) * eased)
+        current_y = int(start_y + (center_y - start_y) * eased)
+        alpha = min(1.0, eased)
+        show_purple = True
+        show_fire = False
+        text_alpha = alpha
+        ball_progress = -1  # No ball
+        show_smash = True
+        show_fireball = False
+
+    elif phase == 'stay':
+        current_x = center_x
+        current_y = center_y
+        alpha = 1.0
+        show_purple = True
+        show_fire = False
+        text_alpha = 1.0
+        ball_progress = -1
+        show_smash = True
+        show_fireball = False
+
+    elif phase == 'ball_transition':
+        current_x = center_x
+        current_y = center_y
+        alpha = 1.0
+        # Crossfade between purple and fire bar
+        show_purple = progress < 0.5
+        show_fire = progress >= 0.3
+        purple_alpha = max(0, 1.0 - progress * 2) if progress < 0.5 else 0
+        fire_alpha = min(1.0, (progress - 0.3) * 2) if progress >= 0.3 else 0
+        # Ball moves from left to right
+        ball_progress = progress
+        # Text fades based on ball position
+        show_smash = progress < 0.4
+        show_fireball = progress > 0.6
+        text_alpha = 1.0
+
+    elif phase == 'stay_fire':
+        current_x = center_x
+        current_y = center_y
+        alpha = 1.0
+        show_purple = False
+        show_fire = True
+        text_alpha = 1.0
+        ball_progress = -1
+        show_smash = False
+        show_fireball = True
+
+    elif phase == 'exit':
+        # Exit to top-right corner
+        end_x = frame_w + 100
+        end_y = -target_height - 100
+        eased = progress ** 2
+        current_x = int(center_x + (end_x - center_x) * eased)
+        current_y = int(center_y + (end_y - center_y) * eased)
+        alpha = max(0, 1.0 * (1 - eased))
+        show_purple = False
+        show_fire = True
+        text_alpha = alpha
+        ball_progress = -1
+        show_smash = False
+        show_fireball = True
+
+    else:  # Default stay
+        current_x = center_x
+        current_y = center_y
+        alpha = 1.0
+        show_purple = True
+        show_fire = False
+        text_alpha = 1.0
+        ball_progress = -1
+        show_smash = True
+        show_fireball = False
+
+    # Calculate placement
+    place_x = current_x - target_width // 2
+    place_y = current_y - target_height // 2
+
+    # Draw banner(s)
+    if phase == 'ball_transition':
+        # Crossfade between banners
+        if show_purple and purple_alpha > 0:
+            _blend_image_onto_frame(frame, purple_scaled, place_x, place_y, purple_alpha)
+        if show_fire and fire_scaled is not None and fire_alpha > 0:
+            _blend_image_onto_frame(frame, fire_scaled, place_x, place_y, fire_alpha)
+    else:
+        if show_purple:
+            _blend_image_onto_frame(frame, purple_scaled, place_x, place_y, alpha)
+        if show_fire and fire_scaled is not None:
+            _blend_image_onto_frame(frame, fire_scaled, place_x, place_y, alpha)
+
+    # Common text position (same for both SMASH and FIREBALL)
+    text_center_x = current_x + 50
+    text_center_y = current_y
+
+    # Pre-calculate text dimensions
+    text_h = int(target_height * 0.85)
+    smash_text = _load_resource_image('SMASH')
+    fireball_text = _load_resource_image('FIREBALL')
+
+    # Draw text
+    if show_smash and smash_text is not None and text_alpha > 0.1:
+        smash_fade = text_alpha
+        if phase == 'ball_transition':
+            smash_fade = max(0, 1.0 - progress * 2.5)
+
+        if smash_fade > 0.05:
+            txt_scale = text_h / smash_text.shape[0]
+            text_w = int(smash_text.shape[1] * txt_scale)
+            text_scaled = _get_scaled_image('SMASH', text_w, text_h)
+            if text_scaled is not None:
+                text_place_x = text_center_x - text_w // 2
+                text_place_y = text_center_y - text_h // 2
+                _blend_image_onto_frame(frame, text_scaled, text_place_x, text_place_y, smash_fade)
+
+    if show_fireball and fireball_text is not None and text_alpha > 0.1:
+        fireball_fade = text_alpha
+        if phase == 'ball_transition':
+            fireball_fade = min(1.0, (progress - 0.5) * 2.5)
+
+        if fireball_fade > 0.05:
+            txt_scale = text_h / fireball_text.shape[0]
+            text_w = int(fireball_text.shape[1] * txt_scale)
+            text_scaled = _get_scaled_image('FIREBALL', text_w, text_h)
+            if text_scaled is not None:
+                text_place_x = text_center_x - text_w // 2
+                text_place_y = text_center_y - text_h // 2
+                _blend_image_onto_frame(frame, text_scaled, text_place_x, text_place_y, fireball_fade)
+
+    # Draw ball during transition - rotated and moving in same direction as banner
+    if ball_progress >= 0:
+        import math
+
+        # Get cached rotated ball
+        ball_size = int(target_height * 0.8)
+        ball_rotated, canvas_size = _get_rotated_ball(ball_size, rotation_angle=15)
+
+        if ball_rotated is not None:
+            # Ball moves from bottom-left to top-right (same direction as banner enters)
+            angle_rad = math.radians(-15)
+            travel_distance = target_width + canvas_size
+
+            # Start: bottom-left of banner area, centered vertically on banner
+            ball_start_x = place_x - canvas_size
+            y_travel = travel_distance * math.sin(abs(angle_rad))
+            ball_center_y = current_y
+
+            ball_x = int(ball_start_x + travel_distance * ball_progress * math.cos(angle_rad))
+            ball_y = int(ball_center_y + y_travel * 0.5 - y_travel * ball_progress) - canvas_size // 2
+
+            _blend_image_onto_frame(frame, ball_rotated, ball_x, ball_y, 1.0)
+
+    return frame
+
+
 def draw_pose_on_frame(frame, keypoints, alpha=1.0, thickness=2):
-    """Draw pose skeleton on frame with optional transparency (same as original algorithm)"""
+    """Draw pose skeleton on frame with optional transparency"""
     if keypoints is None:
         return frame
 
     head_indices = {0, 1, 2, 3, 4}
     overlay = frame.copy()
 
-    # Draw skeleton lines
     for joint in POSE_SKELETON:
         if joint[0] in head_indices or joint[1] in head_indices:
             continue
@@ -104,7 +359,6 @@ def draw_pose_on_frame(frame, keypoints, alpha=1.0, thickness=2):
             cv2.line(overlay, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])),
                      line_color, thickness + 2, cv2.LINE_AA)
 
-    # Draw keypoint circles
     for i, (x, y, conf) in enumerate(keypoints):
         if conf > 0.5 and i < len(KEYPOINT_PARTS) and i not in head_indices:
             part = KEYPOINT_PARTS[i]
@@ -115,832 +369,808 @@ def draw_pose_on_frame(frame, keypoints, alpha=1.0, thickness=2):
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
     return frame
 
-
-def load_shot_data(csv_path, fps=30):
-    df = pd.read_csv(csv_path)
-    shot_data = []
-    for _, row in df.iterrows():
-        frame_num = int(row['timestamp'] * fps)
-        shot_data.append({
-            'frame': frame_num,
-            'player_id': int(row['player_id']),
-            'shot_type': row['shot_type'],
-            'second': row['timestamp']
-        })
-    return shot_data
-
-
-def draw_ball_trajectory(frame, ball_positions, current_frame, shot_frame, color=(0, 255, 255)):
-    """Draw ball trajectory with projection arc"""
-    # Get ball positions around the shot
-    positions = []
-    for f_idx in range(max(0, shot_frame - 5), min(len(ball_positions), current_frame + 1)):
-        if 1 in ball_positions[f_idx]:
-            bbox = ball_positions[f_idx][1]
-            cx = int((bbox[0] + bbox[2]) / 2)
-            cy = int((bbox[1] + bbox[3]) / 2)
-            positions.append((cx, cy, f_idx))
-
-    if len(positions) < 2:
-        return frame
-
-    # Draw trajectory trail with fading effect
-    for i in range(1, len(positions)):
-        alpha = i / len(positions)
-        thickness = max(1, int(4 * alpha))
-        pt1 = positions[i-1][:2]
-        pt2 = positions[i][:2]
-
-        # Color fades from dim to bright
-        c = tuple(int(c * alpha) for c in color)
-        cv2.line(frame, pt1, pt2, c, thickness, cv2.LINE_AA)
-
-    # Draw current ball position with glow
-    if positions:
-        last_pos = positions[-1][:2]
-        for r in range(15, 5, -3):
-            alpha = (15 - r) / 10
-            glow_color = tuple(int(c * alpha) for c in color)
-            cv2.circle(frame, last_pos, r, glow_color, -1, cv2.LINE_AA)
-        cv2.circle(frame, last_pos, 6, color, -1, cv2.LINE_AA)
-
-    return frame
+# Video configs (same as multi_video_analysis.py)
+VIDEO_CONFIGS = [
+    {
+        'video_path': 'inputs/video_1.mp4',
+        'shot_data_path': 'shot_data_video_1.csv',
+        'sides_switched': False,
+    },
+    {
+        'video_path': 'inputs/video_3.mp4',
+        'shot_data_path': 'shot_data_video_3.csv',
+        'sides_switched': True,
+    },
+    {
+        'video_path': 'inputs/video_4.mp4',
+        'shot_data_path': 'shot_data_video_4.csv',
+        'sides_switched': False,
+    },
+    {
+        'video_path': 'inputs/video_5.mp4',
+        'shot_data_path': 'shot_data_video_5.csv',
+        'sides_switched': True,
+    },
+]
 
 
-def draw_speed_indicator(frame, speed, x, y, is_best=False):
-    """Draw speed indicator with styling"""
+def load_cumulative_stats():
+    """Load cumulative stats from the main analysis if available"""
+    stats_path = "tracker_stubs/cumulative_stats.pkl"
+    if os.path.exists(stats_path):
+        with open(stats_path, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+
+def load_shot_speeds():
+    """Load shot speeds from the main analysis if available"""
+    speeds_path = "tracker_stubs/shot_speeds.pkl"
+    if os.path.exists(speeds_path):
+        with open(speeds_path, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+
+def get_shot_speed(shot_speeds, video_path, timestamp, player_id):
+    """Get the speed for a specific shot"""
+    if shot_speeds is None:
+        return None
+
+    video_shots = shot_speeds.get(video_path, [])
+    for shot in video_shots:
+        # Match by timestamp and player_id
+        if abs(shot['timestamp'] - timestamp) < 0.1 and shot['player_id'] == player_id:
+            return shot.get('speed', 0)
+    return None
+
+
+def get_player_stats_from_cumulative(player_id, cumulative_stats):
+    """Extract player stats from cumulative stats dictionary"""
+    if cumulative_stats is None:
+        return None
+
+    pid = player_id
+    shots = cumulative_stats.get(f'player_{pid}_number_of_shots', 0)
+    total_speed = cumulative_stats.get(f'player_{pid}_total_shot_speed', 0)
+    avg_speed = total_speed / max(shots, 1)
+    distance = cumulative_stats.get(f'player_{pid}_total_distance', 0)
+
+    return {
+        'total_shots': shots,
+        'forehands': cumulative_stats.get(f'player_{pid}_forehand', 0),
+        'backhands': cumulative_stats.get(f'player_{pid}_backhand', 0),
+        'smashes': cumulative_stats.get(f'player_{pid}_smash', 0),
+        'lobs': cumulative_stats.get(f'player_{pid}_lob', 0),
+        'serves': cumulative_stats.get(f'player_{pid}_serve', 0),
+        'avg_speed': avg_speed,
+        'distance': distance,
+        'unforced_errors': cumulative_stats.get(f'player_{pid}_unforced_errors', 0),
+        'winners': cumulative_stats.get(f'player_{pid}_winners', 0),
+        '1st_serve_won': cumulative_stats.get(f'player_{pid}_1st_serve_won', 0),
+        '2nd_serve_won': cumulative_stats.get(f'player_{pid}_2nd_serve_won', 0),
+        'serve_breaks': cumulative_stats.get(f'player_{pid}_serve_breaks', 0),
+        'lobs_before_line': cumulative_stats.get(f'player_{pid}_lobs_before_line', 0),
+        'lobs_behind_line': cumulative_stats.get(f'player_{pid}_lobs_behind_line', 0),
+    }
+
+
+def calculate_player_score(stats):
+    """Calculate player performance score (0-100) based on stats"""
+    score = 50  # Base score
+
+    # Shots contribution (max +20)
+    total_shots = stats.get('total_shots', 0)
+    if total_shots > 0:
+        score += min(total_shots * 2, 20)
+
+    # Smashes are aggressive plays (+5 each, max +15)
+    smashes = stats.get('smashes', 0)
+    score += min(smashes * 5, 15)
+
+    # Winners are excellent shots (+4 each, max +12)
+    winners = stats.get('winners', 0)
+    score += min(winners * 4, 12)
+
+    # Serve points won (+3 each)
+    serve_won = stats.get('1st_serve_won', 0) + stats.get('2nd_serve_won', 0)
+    score += serve_won * 3
+
+    # Serve breaks are valuable (+5 each)
+    serve_breaks = stats.get('serve_breaks', 0)
+    score += serve_breaks * 5
+
+    # Unforced errors are bad (-5 each)
+    errors = stats.get('unforced_errors', 0)
+    score -= errors * 5
+
+    return max(0, min(100, int(score)))
+
+
+def create_player_intro(player_id, player_stats, frame_w=1920, frame_h=1080,
+                        title_suffix="BEST MOMENTS", duration_sec=3, fps=30,
+                        team_image_override=None, show_player_number=True):
+    """Create professional player intro frames"""
+    if player_id in [1, 2]:
+        team_name = "TEAM 1"
+        team_color = (80, 200, 80)
+        accent_color = (120, 255, 120)
+        team_image_path = "team.png"
+    else:
+        team_name = "TEAM 2"
+        team_color = (80, 80, 200)
+        accent_color = (120, 120, 255)
+        team_image_path = "red_team.png"
+
+    # Override team image if specified
+    if team_image_override:
+        team_image_path = team_image_override
+
+    frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+
+    for y in range(frame_h):
+        progress = y / frame_h
+        b = int(40 - progress * 20)
+        g = int(30 - progress * 15)
+        r = int(25 - progress * 12)
+        frame[y, :] = [max(b, 10), max(g, 8), max(r, 6)]
+
+    if os.path.exists(team_image_path):
+        team_img = cv2.imread(team_image_path, cv2.IMREAD_UNCHANGED)
+        if team_img is not None:
+            if len(team_img.shape) > 2 and team_img.shape[2] == 4:
+                team_img = team_img[:, :, :3].copy()
+            img_aspect = team_img.shape[1] / team_img.shape[0]
+            frame_aspect = frame_w / frame_h
+            if img_aspect > frame_aspect:
+                img_w = frame_w
+                img_h = int(img_w / img_aspect)
+            else:
+                img_h = frame_h
+                img_w = int(img_h * img_aspect)
+            team_resized = cv2.resize(team_img, (img_w, img_h))
+            img_x = (frame_w - img_w) // 2
+            img_y = (frame_h - img_h) // 2
+            opacity = 0.15
+            roi = frame[img_y:img_y+img_h, img_x:img_x+img_w].astype(np.float32)
+            blended = roi * (1 - opacity) + team_resized.astype(np.float32) * opacity
+            frame[img_y:img_y+img_h, img_x:img_x+img_w] = blended.astype(np.uint8)
+
+    center_x, center_y = frame_w // 2, frame_h // 2
+    Y, X = np.ogrid[:frame_h, :frame_w]
+    dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
+    max_dist = np.sqrt(center_x**2 + center_y**2)
+    vignette = 1 - (dist / max_dist) * 0.4
+    for c in range(3):
+        frame[:, :, c] = (frame[:, :, c] * vignette).astype(np.uint8)
+
+    logo_img = None
+    if os.path.exists("logo.png"):
+        logo_img = cv2.imread("logo.png", cv2.IMREAD_UNCHANGED)
+
     font = cv2.FONT_HERSHEY_SIMPLEX
+    left_x = 150
+    badge_y = 80
 
-    # Background box
-    speed_text = f"{speed:.0f} km/h"
-    (tw, th), _ = cv2.getTextSize(speed_text, font, 1.2, 3)
-
-    box_x = x - tw // 2 - 15
-    box_y = y - th - 15
-    box_w = tw + 30
-    box_h = th + 25
-
-    # Gradient background based on speed
-    if speed > 80:
-        bg_color = (0, 0, 180)  # Red for fast
-    elif speed > 60:
-        bg_color = (0, 140, 180)  # Orange for medium
+    cv2.rectangle(frame, (left_x, badge_y), (left_x + 300, badge_y + 8), team_color, -1)
+    cv2.putText(frame, team_name, (left_x, badge_y + 50), font, 1.0, team_color, 2, cv2.LINE_AA)
+    if show_player_number:
+        player_text = f"PLAYER {player_id}"
+        cv2.putText(frame, player_text, (left_x, badge_y + 150), font, 3.0, (255, 255, 255), 5, cv2.LINE_AA)
+        cv2.line(frame, (left_x, badge_y + 175), (left_x + 500, badge_y + 175), accent_color, 3)
+        cv2.putText(frame, title_suffix, (left_x, badge_y + 230), font, 1.5, (180, 180, 180), 2, cv2.LINE_AA)
     else:
-        bg_color = (0, 180, 80)  # Green for normal
+        # No player number - show title as main text
+        cv2.putText(frame, title_suffix, (left_x, badge_y + 150), font, 3.0, (255, 255, 255), 5, cv2.LINE_AA)
+        cv2.line(frame, (left_x, badge_y + 175), (left_x + 500, badge_y + 175), accent_color, 3)
 
-    # Draw box with glow if best shot
-    if is_best:
-        for i in range(3):
-            cv2.rectangle(frame, (box_x - i*2, box_y - i*2),
-                         (box_x + box_w + i*2, box_y + box_h + i*2),
-                         (0, 200, 255), 2)
+    card_x = frame_w // 2 - 200
+    card_y = 350
+    card_w = 400
+    card_h = 450
 
-    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), bg_color, -1)
-    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (255, 255, 255), 2)
+    for i in range(8, 0, -1):
+        alpha = 0.05 * i
+        cv2.rectangle(frame, (card_x + i, card_y + i),
+                     (card_x + card_w + i, card_y + card_h + i),
+                     (int(5*alpha), int(5*alpha), int(8*alpha)), -1)
 
-    # Speed text
-    cv2.putText(frame, speed_text, (box_x + 15, box_y + th + 8),
-               font, 1.2, (255, 255, 255), 3, cv2.LINE_AA)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (35, 35, 40), -1)
+    cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
+    cv2.rectangle(frame, (card_x, card_y), (card_x + card_w, card_y + card_h), (60, 60, 70), 2)
+    cv2.rectangle(frame, (card_x, card_y), (card_x + card_w, card_y + 6), accent_color, -1)
+    cv2.putText(frame, "MATCH STATS", (card_x + 110, card_y + 50), font, 0.9, (200, 200, 200), 2, cv2.LINE_AA)
+    cv2.line(frame, (card_x + 30, card_y + 70), (card_x + card_w - 30, card_y + 70), (60, 60, 70), 1)
 
-    if is_best:
-        # "BEST" label above
-        cv2.putText(frame, "BEST", (box_x + tw//2 - 10, box_y - 10),
-                   font, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+    display_stats = {
+        'Total Shots': player_stats.get('total_shots', 0),
+        'Forehands': player_stats.get('forehands', 0),
+        'Backhands': player_stats.get('backhands', 0),
+        'Smashes': player_stats.get('smashes', 0),
+        'Lobs': player_stats.get('lobs', 0),
+        'Serves': player_stats.get('serves', 0),
+    }
 
-    return frame
+    row_y = card_y + 110
+    row_height = 38
 
+    for i, (stat_name, stat_value) in enumerate(display_stats.items()):
+        if i % 2 == 0:
+            row_overlay = frame.copy()
+            cv2.rectangle(row_overlay, (card_x + 10, row_y - 22),
+                         (card_x + card_w - 10, row_y + 10), (45, 45, 52), -1)
+            cv2.addWeighted(row_overlay, 0.5, frame, 0.5, 0, frame)
+        cv2.putText(frame, stat_name, (card_x + 25, row_y), font, 0.6, (180, 185, 195), 1, cv2.LINE_AA)
+        val_str = str(stat_value)
+        (vw, _), _ = cv2.getTextSize(val_str, font, 0.7, 2)
+        cv2.putText(frame, val_str, (card_x + card_w - vw - 25, row_y), font, 0.7, accent_color, 2, cv2.LINE_AA)
+        row_y += row_height
 
-def overlay_logo(frame, logo_img, x, y, alpha=1.0):
-    """Overlay logo with alpha channel support"""
-    if logo_img is None:
-        return frame
-    h, w = logo_img.shape[:2]
-    if y + h > frame.shape[0] or x + w > frame.shape[1] or y < 0 or x < 0:
-        return frame
-    if logo_img.shape[2] == 4:
-        logo_alpha = (logo_img[:, :, 3] / 255.0) * alpha
-        logo_alpha = np.dstack([logo_alpha] * 3)
-        logo_rgb = logo_img[:, :, :3]
-        roi = frame[y:y+h, x:x+w].astype(np.float32)
-        blended = logo_rgb * logo_alpha + roi * (1 - logo_alpha)
-        frame[y:y+h, x:x+w] = blended.astype(np.uint8)
-    return frame
+    right_x = frame_w - 400
+    player_score = calculate_player_score(player_stats)
+    circle_center = (right_x + 150, 380)
+    circle_radius = 130
+    circle_thickness = 18
 
+    cv2.circle(frame, circle_center, circle_radius, (40, 40, 45), circle_thickness, cv2.LINE_AA)
+    start_angle = -90
+    end_angle = -90 + (player_score / 100) * 360
 
-def draw_text_with_glow(frame, text, pos, font, scale, color, thickness, glow_color=None, glow_size=3):
-    """Draw text with professional glow effect"""
-    x, y = pos
-    if glow_color:
-        for i in range(glow_size, 0, -1):
-            glow_alpha = 0.3 * (1 - i/glow_size)
-            glow_c = tuple(int(c * glow_alpha) for c in glow_color)
-            cv2.putText(frame, text, (x, y), font, scale, glow_c, thickness + i*2, cv2.LINE_AA)
-    cv2.putText(frame, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+    for i in range(3, 0, -1):
+        glow_color = (int(accent_color[0] * 0.3), int(accent_color[1] * 0.3), int(accent_color[2] * 0.3))
+        cv2.ellipse(frame, circle_center, (circle_radius, circle_radius),
+                   0, start_angle, end_angle, glow_color, circle_thickness + i*4, cv2.LINE_AA)
+    cv2.ellipse(frame, circle_center, (circle_radius, circle_radius),
+               0, start_angle, end_angle, accent_color, circle_thickness, cv2.LINE_AA)
 
+    score_text = str(player_score)
+    (sw, sh), _ = cv2.getTextSize(score_text, font, 3.0, 5)
+    cv2.putText(frame, score_text, (circle_center[0] - sw//2, circle_center[1] + 20),
+               font, 3.0, (255, 255, 255), 5, cv2.LINE_AA)
+    cv2.putText(frame, "/100", (circle_center[0] - 35, circle_center[1] + 60),
+               font, 0.9, (120, 120, 130), 2, cv2.LINE_AA)
+    cv2.putText(frame, "PERFORMANCE", (circle_center[0] - 95, circle_center[1] - circle_radius - 80),
+               font, 0.8, (150, 150, 160), 2, cv2.LINE_AA)
+    cv2.putText(frame, "RATING", (circle_center[0] - 50, circle_center[1] - circle_radius - 55),
+               font, 0.7, (100, 100, 110), 1, cv2.LINE_AA)
 
-def create_intro_card(frame_w, frame_h, player_id, logo, duration_frames=75):
-    frames = []
-
-    # Prepare logo
-    logo_large = None
-    if logo is not None:
-        logo_h = 180
-        aspect = logo.shape[1] / logo.shape[0]
+    if logo_img is not None:
+        logo_h = 150
+        aspect = logo_img.shape[1] / logo_img.shape[0]
         logo_w = int(logo_h * aspect)
-        logo_large = cv2.resize(logo, (logo_w, logo_h))
-
-    for i in range(duration_frames):
-        frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-
-        # Professional gradient background
-        center_x, center_y = frame_w // 2, frame_h // 2
-        Y, X = np.ogrid[:frame_h, :frame_w]
-        dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
-        max_dist = np.sqrt(center_x**2 + center_y**2)
-        gradient = 1 - (dist / max_dist) * 0.8
-        gradient = np.clip(gradient * 35, 8, 45).astype(np.uint8)
-        frame[:, :, 0] = gradient
-        frame[:, :, 1] = gradient
-        frame[:, :, 2] = gradient
-
-        progress = i / duration_frames
-        text_alpha = min(1.0, progress * 3) if progress < 0.3 else (1.0 if progress < 0.7 else max(0, 1 - (progress - 0.7) * 3))
-
-        bar_height = int(frame_h * 0.08)
-
-        if text_alpha > 0:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            player_color = PLAYER_COLORS.get(player_id, (255, 255, 255))
-
-            # Decorative line above player text
-            line_y = frame_h // 2 - 100
-            line_w = 200
-            line_color = tuple(int(c * text_alpha * 0.5) for c in player_color)
-            cv2.line(frame, (frame_w//2 - line_w//2, line_y), (frame_w//2 + line_w//2, line_y), line_color, 2, cv2.LINE_AA)
-
-            # Player text with glow
-            player_text = f"PLAYER {player_id}"
-            (pw, ph), _ = cv2.getTextSize(player_text, font, 1.8, 3)
-            color = tuple(int(c * text_alpha) for c in player_color)
-            draw_text_with_glow(frame, player_text, ((frame_w - pw) // 2, frame_h // 2 - 50),
-                               font, 1.8, color, 3, player_color, 4)
-
-            # Main title with glow effect
-            best_text = "BEST SHOTS"
-            (bw, bh), _ = cv2.getTextSize(best_text, font, 2.8, 5)
-            main_color = (int(255 * text_alpha), int(255 * text_alpha), int(255 * text_alpha))
-            glow_color = (int(100 * text_alpha), int(200 * text_alpha), int(255 * text_alpha))
-            draw_text_with_glow(frame, best_text, ((frame_w - bw) // 2, frame_h // 2 + 40),
-                               font, 2.8, main_color, 5, glow_color, 5)
-
-            # Decorative line below
-            line_y2 = frame_h // 2 + 70
-            cv2.line(frame, (frame_w//2 - line_w//2, line_y2), (frame_w//2 + line_w//2, line_y2), line_color, 2, cv2.LINE_AA)
-
-            # Subtitle
-            sub_text = "Fastest & Most Powerful"
-            (sw, sh), _ = cv2.getTextSize(sub_text, font, 0.7, 1)
-            sub_color = (int(150 * text_alpha), int(150 * text_alpha), int(150 * text_alpha))
-            cv2.putText(frame, sub_text, ((frame_w - sw) // 2, frame_h // 2 + 110),
-                       font, 0.7, sub_color, 1, cv2.LINE_AA)
-
-            # Logo at bottom
-            if logo_large is not None:
-                logo_x = (frame_w - logo_large.shape[1]) // 2
-                logo_y = frame_h - bar_height - logo_large.shape[0] - 30
-                overlay_logo(frame, logo_large, logo_x, logo_y, text_alpha * 0.9)
-
-        cv2.rectangle(frame, (0, 0), (frame_w, bar_height), (0, 0, 0), -1)
-        cv2.rectangle(frame, (0, frame_h - bar_height), (frame_w, frame_h), (0, 0, 0), -1)
-        frames.append(frame)
-
-    return frames
-
-
-def create_shot_title_card(frame_w, frame_h, shot_type, speed, rank, logo, is_scoring=False, duration_frames=40):
-    frames = []
-
-    # Prepare small logo
-    logo_small = None
-    if logo is not None:
-        logo_h = 80
-        aspect = logo.shape[1] / logo.shape[0]
-        logo_w = int(logo_h * aspect)
-        logo_small = cv2.resize(logo, (logo_w, logo_h))
-
-    for i in range(duration_frames):
-        frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-
-        # Subtle gradient background
-        Y, X = np.ogrid[:frame_h, :frame_w]
-        gradient = np.clip(25 + (Y / frame_h) * 15, 20, 40).astype(np.uint8)
-        frame[:, :, 0] = gradient
-        frame[:, :, 1] = gradient
-        frame[:, :, 2] = gradient
-
-        progress = i / duration_frames
-        text_alpha = min(1.0, progress * 4) if progress < 0.25 else 1.0
-
-        bar_height = int(frame_h * 0.08)
-
-        if text_alpha > 0:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-
-            # Rank badge with background
-            rank_text = f"#{rank}"
-            (rw, rh), _ = cv2.getTextSize(rank_text, font, 2.2, 4)
-            rank_x = (frame_w - rw) // 2
-            rank_y = frame_h // 2 - 70
-
-            # Badge background
-            badge_color = (int(50 * text_alpha), int(50 * text_alpha), int(60 * text_alpha))
-            cv2.rectangle(frame, (rank_x - 20, rank_y - rh - 10), (rank_x + rw + 20, rank_y + 15), badge_color, -1)
-            cv2.rectangle(frame, (rank_x - 20, rank_y - rh - 10), (rank_x + rw + 20, rank_y + 15),
-                         (int(100 * text_alpha), int(180 * text_alpha), int(255 * text_alpha)), 2)
-
-            rank_color = (int(100 * text_alpha), int(200 * text_alpha), int(255 * text_alpha))
-            cv2.putText(frame, rank_text, (rank_x, rank_y), font, 2.2, rank_color, 4, cv2.LINE_AA)
-
-            # Shot type with glow
-            type_text = shot_type.upper()
-            (tw, th), _ = cv2.getTextSize(type_text, font, 2.8, 5)
-            type_color = (int(255 * text_alpha), int(255 * text_alpha), int(255 * text_alpha))
-            glow_c = (int(80 * text_alpha), int(160 * text_alpha), int(255 * text_alpha))
-            draw_text_with_glow(frame, type_text, ((frame_w - tw) // 2, frame_h // 2 + 20),
-                               font, 2.8, type_color, 5, glow_c, 4)
-
-            # Speed with icon-style box
-            speed_text = f"{speed:.0f} km/h"
-            (spw, sph), _ = cv2.getTextSize(speed_text, font, 1.4, 3)
-            speed_x = (frame_w - spw) // 2
-            speed_y = frame_h // 2 + 85
-
-            # Speed background
-            cv2.rectangle(frame, (speed_x - 15, speed_y - sph - 8), (speed_x + spw + 15, speed_y + 8),
-                         (int(20 * text_alpha), int(80 * text_alpha), int(80 * text_alpha)), -1)
-            speed_color = (int(100 * text_alpha), int(255 * text_alpha), int(255 * text_alpha))
-            cv2.putText(frame, speed_text, (speed_x, speed_y), font, 1.4, speed_color, 3, cv2.LINE_AA)
-
-            if is_scoring:
-                # Winning shot banner
-                score_text = "WINNING SHOT"
-                (scw, sch), _ = cv2.getTextSize(score_text, font, 1.1, 2)
-                score_x = (frame_w - scw) // 2
-                score_y = frame_h // 2 + 145
-
-                # Banner background
-                cv2.rectangle(frame, (score_x - 25, score_y - sch - 10), (score_x + scw + 25, score_y + 10),
-                             (int(30 * text_alpha), int(100 * text_alpha), int(30 * text_alpha)), -1)
-                cv2.rectangle(frame, (score_x - 25, score_y - sch - 10), (score_x + scw + 25, score_y + 10),
-                             (int(100 * text_alpha), int(255 * text_alpha), int(100 * text_alpha)), 2)
-                cv2.putText(frame, score_text, (score_x, score_y),
-                           font, 1.1, (int(100 * text_alpha), int(255 * text_alpha), int(100 * text_alpha)), 2, cv2.LINE_AA)
-
-            # Logo at bottom right
-            if logo_small is not None:
-                logo_x = frame_w - logo_small.shape[1] - 40
-                logo_y = frame_h - bar_height - logo_small.shape[0] - 15
-                overlay_logo(frame, logo_small, logo_x, logo_y, text_alpha * 0.8)
-
-        cv2.rectangle(frame, (0, 0), (frame_w, bar_height), (0, 0, 0), -1)
-        cv2.rectangle(frame, (0, frame_h - bar_height), (frame_w, frame_h), (0, 0, 0), -1)
-        frames.append(frame)
-
-    return frames
-
-
-def create_shot_highlight(video_frames, player_detections, ball_detections, shot, pose_model,
-                          frame_w, frame_h, player_id, speed, rank, slowmo_factor=4,
-                          context_before=20, context_after=50):
-    frames = []
-    shot_frame = shot['frame']
-    start_frame = max(0, shot_frame - context_before)
-    end_frame = min(len(video_frames) - 1, shot_frame + context_after)
-
-    # Pre-compute poses for highlighted player only
-    poses = {}
-    for frame_idx in range(start_frame, end_frame + 1):
-        bbox = player_detections[frame_idx].get(player_id)
-        if bbox:
-            x1, y1, x2, y2 = bbox
-            player_cx = (x1 + x2) / 2
-            player_cy = (y1 + y2) / 2
-
-            # Use tighter padding to minimize detecting other players
-            padding = max(x2 - x1, y2 - y1) * 0.35
-            crop_x1, crop_y1 = max(0, int(x1 - padding)), max(0, int(y1 - padding))
-            crop_x2, crop_y2 = min(frame_w, int(x2 + padding)), min(frame_h, int(y2 + padding))
-            cropped = video_frames[frame_idx][crop_y1:crop_y2, crop_x1:crop_x2].copy()
-
-            h, w = cropped.shape[:2]
-            if h > 0 and w > 0:
-                scale = 1.0
-                if w < 300 or h < 300:
-                    scale = 300 / min(w, h)
-                    cropped = cv2.resize(cropped, (int(w * scale), int(h * scale)))
-
-                results = pose_model(cropped, verbose=False)[0]
-                if results.keypoints is not None and len(results.keypoints.data) > 0:
-                    # If multiple poses detected, select the one closest to player center
-                    best_pose = None
-                    best_dist = float('inf')
-
-                    for pose_data in results.keypoints.data:
-                        # Convert to CPU if on CUDA
-                        pose_cpu = pose_data.cpu().numpy() if hasattr(pose_data, 'cpu') else pose_data
-
-                        # Calculate pose center using hip points (11, 12) or shoulder points (5, 6)
-                        hip_pts = [pose_cpu[11], pose_cpu[12]]
-                        valid_pts = [p for p in hip_pts if p[2] > 0.3]
-                        if not valid_pts:
-                            shoulder_pts = [pose_cpu[5], pose_cpu[6]]
-                            valid_pts = [p for p in shoulder_pts if p[2] > 0.3]
-
-                        if valid_pts:
-                            pose_cx = sum(float(p[0]) for p in valid_pts) / len(valid_pts) / scale + crop_x1
-                            pose_cy = sum(float(p[1]) for p in valid_pts) / len(valid_pts) / scale + crop_y1
-                            dist = np.sqrt((pose_cx - player_cx)**2 + (pose_cy - player_cy)**2)
-
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_pose = pose_cpu
-
-                    if best_pose is not None:
-                        adjusted = [[float(best_pose[idx][0]) / scale + crop_x1,
-                                    float(best_pose[idx][1]) / scale + crop_y1,
-                                    float(best_pose[idx][2])] for idx in range(17)]
-                        poses[frame_idx] = np.array(adjusted)
-
-    replay_count = 0
-    for frame_idx in range(start_frame, end_frame + 1):
-        raw = video_frames[frame_idx].copy()
-        dimmed = (raw * 0.35).astype(np.uint8)
-
-        # Player spotlight mask
-        mask = np.zeros((frame_h, frame_w), dtype=np.float32)
-        bbox = player_detections[frame_idx].get(player_id)
-        player_center = None
-        if bbox:
-            x1, y1, x2, y2 = bbox
-            player_center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-            pad = 60
-            bx1, by1 = max(0, int(x1 - pad)), max(0, int(y1 - pad))
-            bx2, by2 = min(frame_w, int(x2 + pad)), min(frame_h, int(y2 + pad))
-            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-            w, h = (bx2 - bx1) // 2, (by2 - by1) // 2
-            Y, X = np.ogrid[:frame_h, :frame_w]
-            ellipse = ((X - cx) / (w + 40))**2 + ((Y - cy) / (h + 40))**2
-            mask = np.maximum(mask, np.clip(1 - ellipse, 0, 1))
-
-        mask = cv2.GaussianBlur(mask, (61, 61), 0)
-        mask_3ch = np.dstack([np.clip(mask, 0, 1)] * 3)
-
-        highlight_frame = (raw * mask_3ch + dimmed * (1 - mask_3ch)).astype(np.uint8)
-        highlight_frame = cv2.convertScaleAbs(highlight_frame, alpha=1.1, beta=5)
-
-        # Draw ball trajectory
-        highlight_frame = draw_ball_trajectory(highlight_frame, ball_detections, frame_idx, shot_frame)
-
-        # Letterbox bars
-        bar_height = int(frame_h * 0.08)
-        cv2.rectangle(highlight_frame, (0, 0), (frame_w, bar_height), (0, 0, 0), -1)
-        cv2.rectangle(highlight_frame, (0, frame_h - bar_height), (frame_w, frame_h), (0, 0, 0), -1)
-
-        # Player and shot info
-        player_color = PLAYER_COLORS.get(player_id, (255, 255, 255))
-        cv2.putText(highlight_frame, f"P{player_id}", (50, bar_height + 40),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, player_color, 2, cv2.LINE_AA)
-        cv2.putText(highlight_frame, shot['shot_type'].upper(), (50, bar_height + 75),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
-
-        # Rank badge
-        cv2.putText(highlight_frame, f"#{rank} BEST", (50, bar_height + 110),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2, cv2.LINE_AA)
-
-        # Speed indicator near player (after shot moment)
-        if frame_idx >= shot_frame and player_center:
-            draw_speed_indicator(highlight_frame, speed, player_center[0], player_center[1] - 100, is_best=(rank == 1))
-
-        # Slow motion indicator
-        flash_alpha = (np.sin(replay_count * 0.3) + 1) / 2
-        slowmo_color = (int(100 + 155 * flash_alpha), 200, 255)
-        cv2.putText(highlight_frame, "SLOW-MO", (frame_w - 180, bar_height + 40),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, slowmo_color, 2, cv2.LINE_AA)
-
-        # Draw pose
-        pose = poses.get(frame_idx)
-        if pose is not None:
-            draw_pose_on_frame(highlight_frame, pose, alpha=0.9, thickness=3)
-
-        for _ in range(slowmo_factor):
-            frames.append(highlight_frame.copy())
-            replay_count += 1
-
-    return frames
-
-
-def create_stats_card(frame_w, frame_h, player_id, shots, logo, duration_frames=90):
-    frames = []
-
-    if not shots:
-        return frames
-
-    # Calculate stats
-    avg_speed = sum(s['speed'] for s in shots) / len(shots)
-    max_speed = max(s['speed'] for s in shots)
-
-    # Prepare logo
-    logo_med = None
-    if logo is not None:
-        logo_h = 120
-        aspect = logo.shape[1] / logo.shape[0]
-        logo_w = int(logo_h * aspect)
-        logo_med = cv2.resize(logo, (logo_w, logo_h))
-
-    for i in range(duration_frames):
-        frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
-
-        # Professional gradient background
-        center_x, center_y = frame_w // 2, frame_h // 2
-        Y, X = np.ogrid[:frame_h, :frame_w]
-        dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
-        max_dist = np.sqrt(center_x**2 + center_y**2)
-        gradient = 1 - (dist / max_dist) * 0.7
-        gradient = np.clip(gradient * 40, 10, 45).astype(np.uint8)
-        frame[:, :, 0] = gradient
-        frame[:, :, 1] = gradient
-        frame[:, :, 2] = gradient
-
-        progress = i / duration_frames
-        text_alpha = min(1.0, progress * 3) if progress < 0.3 else (1.0 if progress < 0.7 else max(0, 1 - (progress - 0.7) * 3))
-
-        bar_height = int(frame_h * 0.08)
-
-        if text_alpha > 0:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            player_color = PLAYER_COLORS.get(player_id, (255, 255, 255))
-
-            # Decorative line above title
-            line_y = 95
-            line_w = 180
-            line_color = tuple(int(c * text_alpha * 0.5) for c in player_color)
-            cv2.line(frame, (frame_w//2 - line_w//2, line_y), (frame_w//2 + line_w//2, line_y), line_color, 2, cv2.LINE_AA)
-
-            # Title with glow
-            title = f"PLAYER {player_id} STATS"
-            (tw, th), _ = cv2.getTextSize(title, font, 1.5, 3)
-            color = tuple(int(c * text_alpha) for c in player_color)
-            draw_text_with_glow(frame, title, ((frame_w - tw) // 2, 140),
-                               font, 1.5, color, 3, player_color, 4)
-
-            # Decorative line below title
-            line_y2 = 160
-            cv2.line(frame, (frame_w//2 - line_w//2, line_y2), (frame_w//2 + line_w//2, line_y2), line_color, 2, cv2.LINE_AA)
-
-            # Stats with styled boxes
-            y_pos = 220
-
-            # Top Speed stat box
-            stat1 = f"TOP SPEED"
-            speed1 = f"{max_speed:.0f} km/h"
-            (s1w, s1h), _ = cv2.getTextSize(stat1, font, 0.8, 2)
-            (sp1w, sp1h), _ = cv2.getTextSize(speed1, font, 1.5, 3)
-
-            box_w = max(s1w, sp1w) + 60
-            box_x = (frame_w - box_w) // 2
-            box_color = (int(30 * text_alpha), int(50 * text_alpha), int(50 * text_alpha))
-            border_color = (int(80 * text_alpha), int(200 * text_alpha), int(255 * text_alpha))
-
-            cv2.rectangle(frame, (box_x, y_pos - s1h - 10), (box_x + box_w, y_pos + sp1h + 20), box_color, -1)
-            cv2.rectangle(frame, (box_x, y_pos - s1h - 10), (box_x + box_w, y_pos + sp1h + 20), border_color, 2)
-
-            cv2.putText(frame, stat1, ((frame_w - s1w) // 2, y_pos),
-                       font, 0.8, (int(150 * text_alpha), int(150 * text_alpha), int(150 * text_alpha)), 2, cv2.LINE_AA)
-            draw_text_with_glow(frame, speed1, ((frame_w - sp1w) // 2, y_pos + sp1h + 5),
-                               font, 1.5, (int(100 * text_alpha), int(255 * text_alpha), int(255 * text_alpha)), 3,
-                               (int(50 * text_alpha), int(200 * text_alpha), int(255 * text_alpha)), 3)
-
-            # Average Speed and Shots count side by side
-            y_pos += 110
-
-            stat2 = f"AVG: {avg_speed:.0f} km/h"
-            stat3 = f"SHOTS: {len(shots)}"
-            (s2w, s2h), _ = cv2.getTextSize(stat2, font, 1.0, 2)
-            (s3w, s3h), _ = cv2.getTextSize(stat3, font, 1.0, 2)
-
-            gap = 40
-            total_w = s2w + gap + s3w
-            start_x = (frame_w - total_w) // 2
-
-            cv2.putText(frame, stat2, (start_x, y_pos),
-                       font, 1.0, (int(200 * text_alpha), int(200 * text_alpha), int(200 * text_alpha)), 2, cv2.LINE_AA)
-            cv2.putText(frame, stat3, (start_x + s2w + gap, y_pos),
-                       font, 1.0, (int(200 * text_alpha), int(200 * text_alpha), int(200 * text_alpha)), 2, cv2.LINE_AA)
-
-            # Shot breakdown with styled badges
-            y_pos += 60
-            for idx, shot in enumerate(shots):
-                shot_type = shot['shot_type'].upper()
-                shot_speed = f"{shot['speed']:.0f} km/h"
-                is_scoring = shot.get('is_scoring', False)
-
-                # Badge for shot type
-                (stw, sth), _ = cv2.getTextSize(shot_type, font, 0.7, 2)
-                (spw, sph), _ = cv2.getTextSize(shot_speed, font, 0.7, 2)
-
-                badge_w = stw + spw + 80
-                badge_x = (frame_w - badge_w) // 2
-
-                # Badge background
-                if is_scoring:
-                    bg_color = (int(30 * text_alpha), int(80 * text_alpha), int(30 * text_alpha))
-                    border = (int(100 * text_alpha), int(255 * text_alpha), int(100 * text_alpha))
-                else:
-                    bg_color = (int(40 * text_alpha), int(40 * text_alpha), int(45 * text_alpha))
-                    border = (int(80 * text_alpha), int(80 * text_alpha), int(100 * text_alpha))
-
-                cv2.rectangle(frame, (badge_x, y_pos - sth - 5), (badge_x + badge_w, y_pos + 8), bg_color, -1)
-                cv2.rectangle(frame, (badge_x, y_pos - sth - 5), (badge_x + badge_w, y_pos + 8), border, 1)
-
-                # Rank number
-                rank_text = f"#{idx+1}"
-                cv2.putText(frame, rank_text, (badge_x + 10, y_pos),
-                           font, 0.7, (int(100 * text_alpha), int(180 * text_alpha), int(255 * text_alpha)), 2, cv2.LINE_AA)
-
-                # Shot type
-                cv2.putText(frame, shot_type, (badge_x + 45, y_pos),
-                           font, 0.7, (int(220 * text_alpha), int(220 * text_alpha), int(220 * text_alpha)), 2, cv2.LINE_AA)
-
-                # Speed
-                speed_color = (int(100 * text_alpha), int(255 * text_alpha), int(255 * text_alpha))
-                cv2.putText(frame, shot_speed, (badge_x + 45 + stw + 15, y_pos),
-                           font, 0.7, speed_color, 2, cv2.LINE_AA)
-
-                if is_scoring:
-                    cv2.putText(frame, "WIN", (badge_x + badge_w - 40, y_pos),
-                               font, 0.5, (int(100 * text_alpha), int(255 * text_alpha), int(100 * text_alpha)), 1, cv2.LINE_AA)
-
-                y_pos += 38
-
-            # Logo at bottom center
-            if logo_med is not None:
-                logo_x = (frame_w - logo_med.shape[1]) // 2
-                logo_y = frame_h - bar_height - logo_med.shape[0] - 20
-                overlay_logo(frame, logo_med, logo_x, logo_y, text_alpha * 0.85)
-
-        cv2.rectangle(frame, (0, 0), (frame_w, bar_height), (0, 0, 0), -1)
-        cv2.rectangle(frame, (0, frame_h - bar_height), (frame_w, frame_h), (0, 0, 0), -1)
-        frames.append(frame)
-
-    return frames
-
-
-def main():
-    fps = 30
-    player_id = HIGHLIGHT_PLAYER
-
-    print(f"Creating BEST SHOTS highlights for Player {player_id}")
-
-    # Load logo
-    logo = None
-    logo_path = 'logo.png'
-    if os.path.exists(logo_path):
-        logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
-        print(f"Loaded logo: {logo_path}")
-    else:
-        print("Warning: logo.png not found, proceeding without logo")
-
-    # Load pose model
-    print("Loading pose model...")
-    pose_model = YOLO('yolo11m-pose.pt')
-
-    # Collect all player shots with speeds
-    all_player_shots = []
-    video_data_cache = []
-
+        logo_resized = cv2.resize(logo_img, (logo_w, logo_h), interpolation=cv2.INTER_AREA)
+        logo_x = circle_center[0] - logo_w // 2
+        logo_y = circle_center[1] + circle_radius + 80
+        if logo_resized.shape[2] == 4:
+            logo_alpha = logo_resized[:, :, 3] / 255.0 * 0.9
+            logo_alpha_3ch = np.dstack([logo_alpha] * 3)
+            logo_rgb = logo_resized[:, :, :3]
+            roi = frame[logo_y:logo_y+logo_h, logo_x:logo_x+logo_w].astype(np.float32)
+            blended = logo_rgb * logo_alpha_3ch + roi * (1 - logo_alpha_3ch)
+            frame[logo_y:logo_y+logo_h, logo_x:logo_x+logo_w] = blended.astype(np.uint8)
+
+    cv2.line(frame, (100, frame_h - 80), (frame_w - 100, frame_h - 80), (40, 40, 50), 2)
+    cv2.rectangle(frame, (100, frame_h - 85), (200, frame_h - 75), accent_color, -1)
+    cv2.rectangle(frame, (frame_w - 200, frame_h - 85), (frame_w - 100, frame_h - 75), accent_color, -1)
+
+    intro_frames = []
+    total_frames = int(duration_sec * fps)
+    fade_frames = int(fps * 0.5)
+
+    for i in range(total_frames):
+        if i < fade_frames:
+            alpha = i / fade_frames
+            faded = (frame * alpha).astype(np.uint8)
+            intro_frames.append(faded)
+        elif i > total_frames - fade_frames:
+            alpha = (total_frames - i) / fade_frames
+            faded = (frame * alpha).astype(np.uint8)
+            intro_frames.append(faded)
+        else:
+            intro_frames.append(frame.copy())
+
+    return intro_frames
+
+
+def extract_player_shots(player_id, shot_types=None):
+    """Extract all shots for a player across all videos"""
+    all_shots = []
     for video_config in VIDEO_CONFIGS:
         video_path = video_config['video_path']
         shot_data_path = video_config['shot_data_path']
         sides_switched = video_config['sides_switched']
-        is_scoring = video_config.get('is_scoring_point', False)
+        if not os.path.exists(shot_data_path):
+            continue
+        shot_df = pd.read_csv(shot_data_path)
+        for _, row in shot_df.iterrows():
+            pid = int(row['player_id'])
+            shot_type = row['shot_type']
+            timestamp = float(row['timestamp'])
+            if pid != player_id:
+                continue
+            if shot_types and shot_type not in shot_types:
+                continue
+            all_shots.append({
+                'video_path': video_path,
+                'timestamp': timestamp,
+                'shot_type': shot_type,
+                'player_id': pid,
+                'sides_switched': sides_switched,
+            })
+    return all_shots
 
-        print(f"\nProcessing: {video_path}")
 
-        # Read video
-        video_frames = read_video(video_path)
-        frame_h, frame_w = video_frames[0].shape[:2]
-        print(f"  Loaded {len(video_frames)} frames")
+def create_shot_clip(video_path, timestamp, duration_before=1.0, duration_after=1.5, fps=30):
+    """Extract a clip around a shot timestamp"""
+    frames = read_video(video_path)
+    start_frame = max(0, int((timestamp - duration_before) * fps))
+    end_frame = min(len(frames), int((timestamp + duration_after) * fps))
+    return frames[start_frame:end_frame]
 
-        # Load shot data
-        shot_data = load_shot_data(shot_data_path, fps)
 
-        # Load player detections
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        stub_path = f'tracker_stubs/{video_name}_player_detections.pkl'
+def create_shot_clip_with_effects(video_path, timestamp, player_id, pose_model,
+                                   duration_before=1.0, duration_after=2.0, fps=30,
+                                   slowmo_factor=2, shot_type="Shot", ball_speed=None,
+                                   sides_switched=False, show_pose=True, fiery_trail=False):
+    """Extract a clip with focus spotlight, pose skeleton, pause and speed display"""
+    frames = read_video(video_path)
+    frame_h, frame_w = frames[0].shape[:2]
 
-        if os.path.exists(stub_path):
-            with open(stub_path, 'rb') as f:
-                player_detections = pickle.load(f)
-            print("  Loaded player detections from cache")
-        else:
-            player_tracker = PlayerTracker(model_path='yolov8x.pt')
-            player_detections = player_tracker.detect_frames(video_frames)
-            os.makedirs('tracker_stubs', exist_ok=True)
-            with open(stub_path, 'wb') as f:
-                pickle.dump(player_detections, f)
+    start_frame = max(0, int((timestamp - duration_before) * fps))
+    shot_frame = int(timestamp * fps)  # The exact frame where shot happens
+    end_frame = min(len(frames), int((timestamp + duration_after) * fps))
 
-        # Load ball detections
-        ball_stub_path = f'tracker_stubs/{video_name}_ball_detections.pkl'
-        if os.path.exists(ball_stub_path):
-            with open(ball_stub_path, 'rb') as f:
-                ball_detections = pickle.load(f)
-            print("  Loaded ball detections from cache")
-        else:
-            ball_tracker = TrackNetBallTracker(
-                model_path='models/weights/ball_detection/TrackNet_best.pt',
-                device='cuda'
-            )
-            ball_detections = ball_tracker.detect_frames(video_frames)
-            with open(ball_stub_path, 'wb') as f:
-                pickle.dump(ball_detections, f)
+    # Try to load player detections from pickle
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    pickle_path = f"tracker_stubs/{video_name}_player_detections.pkl"
 
-        # Interpolate ball positions
-        ball_tracker_temp = TrackNetBallTracker(
-            model_path='models/weights/ball_detection/TrackNet_best.pt',
-            device='cuda'
-        )
-        ball_detections = ball_tracker_temp.interpolate_ball_positions(ball_detections)
+    player_detections = None
+    if os.path.exists(pickle_path):
+        with open(pickle_path, 'rb') as f:
+            player_detections = pickle.load(f)
 
-        # Court detection for speed calculation
-        court_detector = PadelCourtDetectorColor(use_calibrated=True)
-        court_keypoints = court_detector.predict(video_frames[0])
-        mini_court = MiniCourt(video_frames[0])
-
-        # Convert to mini court coordinates for speed calc
-        _, ball_mini_court = mini_court.convert_bounding_boxes_to_mini_court_coordinates(
-            player_detections, ball_detections, court_keypoints)
-
-        # Swap player IDs if sides switched
+        # Apply side swap if needed (same as main analysis)
         if sides_switched:
-            print("  Swapping player IDs for switched sides...")
-            swapped = []
             swap_map = {1: 3, 2: 4, 3: 1, 4: 2}
+            swapped_detections = []
             for frame_dict in player_detections:
                 new_dict = {}
                 for pid, bbox in frame_dict.items():
-                    new_pid = swap_map.get(pid, pid)
-                    new_dict[new_pid] = bbox
-                swapped.append(new_dict)
-            player_detections = swapped
+                    new_dict[swap_map.get(pid, pid)] = bbox
+                swapped_detections.append(new_dict)
+            player_detections = swapped_detections
 
-        # Calculate speeds for player shots
-        player_shots = [s for s in shot_data if s['player_id'] == player_id]
-        print(f"  Found {len(player_shots)} shots by P{player_id}")
+    # Load ball detections for fiery trail effect
+    ball_detections = None
+    if fiery_trail:
+        ball_pickle_path = f"tracker_stubs/{video_name}_ball_detections.pkl"
+        if os.path.exists(ball_pickle_path):
+            with open(ball_pickle_path, 'rb') as f:
+                ball_detections = pickle.load(f)
 
-        for i, shot in enumerate(player_shots):
-            # Find next shot to calculate speed
-            shot_idx = shot_data.index(shot)
-            if shot_idx + 1 < len(shot_data):
-                start_frame = shot['frame']
-                end_frame = shot_data[shot_idx + 1]['frame']
-                ball_shot_time = (end_frame - start_frame) / fps
+    processed_frames = []
 
-                if 1 in ball_mini_court[start_frame] and 1 in ball_mini_court[end_frame]:
-                    dist_pixels = measure_distance(ball_mini_court[start_frame][1],
-                                                   ball_mini_court[end_frame][1])
-                    dist_meters = convert_pixel_distance_to_meters(dist_pixels, constants.DOUBLE_LINE_WIDTH,
-                                                                   mini_court.get_width_of_mini_court())
-                    speed = dist_meters / ball_shot_time * 3.6
-                else:
-                    speed = 50  # Default if can't calculate
+    for frame_idx in range(start_frame, end_frame):
+        raw = frames[frame_idx].copy()
+
+        # If we have player detections, apply focus effect
+        if player_detections is not None and frame_idx < len(player_detections):
+            dimmed = (raw * 0.35).astype(np.uint8)
+
+            # Create spotlight mask
+            mask = np.zeros((frame_h, frame_w), dtype=np.float32)
+            bbox = player_detections[frame_idx].get(player_id)
+
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                pad = 50
+                bx1, by1 = max(0, int(x1 - pad)), max(0, int(y1 - pad))
+                bx2, by2 = min(frame_w, int(x2 + pad)), min(frame_h, int(y2 + pad))
+                cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+                w, h = (bx2 - bx1) // 2, (by2 - by1) // 2
+                Y, X = np.ogrid[:frame_h, :frame_w]
+                ellipse = ((X - cx) / (w + 30))**2 + ((Y - cy) / (h + 30))**2
+                mask = np.maximum(mask, np.clip(1 - ellipse, 0, 1))
+
+            mask = cv2.GaussianBlur(mask, (61, 61), 0)
+            mask = np.clip(mask, 0, 1)
+            mask_3ch = np.dstack([mask] * 3)
+
+            highlight_frame = (raw * mask_3ch + dimmed * (1 - mask_3ch)).astype(np.uint8)
+            highlight_frame = cv2.convertScaleAbs(highlight_frame, alpha=1.1, beta=5)
+
+            # Draw fiery trail effect for ball (if enabled) - only AFTER the shot moment
+            # Hide trail 0.5 seconds after the hit
+            time_after_shot = (frame_idx - shot_frame) / fps
+            trail_duration = 0.75
+
+            if fiery_trail and ball_detections is not None and frame_idx >= shot_frame and time_after_shot <= trail_duration:
+                # Get ball positions for the trail (from shot_frame to current frame)
+                trail_length = 15
+                trail_positions = []
+                max_jump_distance = 80  # Maximum pixels between consecutive positions
+
+                # Start from shot_frame, not before
+                trail_start = max(shot_frame, frame_idx - trail_length)
+                for trail_idx in range(trail_start, frame_idx + 1):
+                    if trail_idx < len(ball_detections):
+                        ball_pos = ball_detections[trail_idx].get(1)  # Ball ID is 1
+                        if ball_pos is not None:
+                            bx = int((ball_pos[0] + ball_pos[2]) / 2)
+                            by = int((ball_pos[1] + ball_pos[3]) / 2)
+
+                            # Filter out false positives (jumps too far from last position)
+                            if trail_positions:
+                                last_x, last_y = trail_positions[-1]
+                                distance = np.sqrt((bx - last_x)**2 + (by - last_y)**2)
+                                if distance > max_jump_distance:
+                                    continue
+
+                            trail_positions.append((bx, by))
+
+                # Draw fiery trail with gradient from orange/red to yellow
+                if len(trail_positions) >= 2:
+                    for i in range(len(trail_positions) - 1):
+                        # Progress along trail (0 = oldest, 1 = newest)
+                        progress = i / (len(trail_positions) - 1)
+
+                        # Fiery colors: dark red -> orange -> yellow
+                        if progress < 0.5:
+                            # Dark red to orange
+                            r = int(80 + progress * 2 * 175)
+                            g = int(progress * 2 * 100)
+                            b = 0
+                        else:
+                            # Orange to bright yellow
+                            r = 255
+                            g = int(100 + (progress - 0.5) * 2 * 155)
+                            b = int((progress - 0.5) * 2 * 100)
+
+                        color = (b, g, r)  # BGR
+                        thickness = int(3 + progress * 8)  # Thicker toward the ball
+
+                        pt1 = trail_positions[i]
+                        pt2 = trail_positions[i + 1]
+
+                        # Draw glow effect (wider, semi-transparent)
+                        glow_overlay = highlight_frame.copy()
+                        cv2.line(glow_overlay, pt1, pt2, (0, int(g*0.5), int(r*0.7)), thickness + 6, cv2.LINE_AA)
+                        cv2.addWeighted(glow_overlay, 0.4, highlight_frame, 0.6, 0, highlight_frame)
+
+                        # Draw main fire line
+                        cv2.line(highlight_frame, pt1, pt2, color, thickness, cv2.LINE_AA)
+
+                    # Draw bright center core at ball position
+                    if trail_positions:
+                        ball_x, ball_y = trail_positions[-1]
+                        # Outer glow
+                        cv2.circle(highlight_frame, (ball_x, ball_y), 18, (0, 100, 255), -1, cv2.LINE_AA)
+                        cv2.circle(highlight_frame, (ball_x, ball_y), 12, (0, 200, 255), -1, cv2.LINE_AA)
+                        # Bright yellow core
+                        cv2.circle(highlight_frame, (ball_x, ball_y), 6, (100, 255, 255), -1, cv2.LINE_AA)
+
+            # Detect and draw pose for the highlighted player (if enabled)
+            pose = None
+            if show_pose and bbox:
+                x1, y1, x2, y2 = bbox
+                player_cx = (x1 + x2) / 2
+                player_cy = (y1 + y2) / 2
+
+                # Crop around player for pose detection
+                padding = max(x2 - x1, y2 - y1) * 0.35
+                crop_x1, crop_y1 = max(0, int(x1 - padding)), max(0, int(y1 - padding))
+                crop_x2, crop_y2 = min(frame_w, int(x2 + padding)), min(frame_h, int(y2 + padding))
+                cropped = frames[frame_idx][crop_y1:crop_y2, crop_x1:crop_x2].copy()
+
+                h_crop, w_crop = cropped.shape[:2]
+                if h_crop > 0 and w_crop > 0:
+                    scale = 1.0
+                    if w_crop < 300 or h_crop < 300:
+                        scale = 300 / min(w_crop, h_crop)
+                        cropped = cv2.resize(cropped, (int(w_crop * scale), int(h_crop * scale)))
+
+                    results = pose_model(cropped, verbose=False)[0]
+                    if results.keypoints is not None and len(results.keypoints.data) > 0:
+                        # Select pose closest to player center
+                        best_pose = None
+                        best_dist = float('inf')
+
+                        for pose_data in results.keypoints.data:
+                            pose_cpu = pose_data.cpu().numpy() if hasattr(pose_data, 'cpu') else pose_data
+
+                            # Calculate pose center using hip or shoulder points
+                            hip_pts = [pose_cpu[11], pose_cpu[12]]
+                            valid_pts = [p for p in hip_pts if p[2] > 0.3]
+                            if not valid_pts:
+                                shoulder_pts = [pose_cpu[5], pose_cpu[6]]
+                                valid_pts = [p for p in shoulder_pts if p[2] > 0.3]
+
+                            if valid_pts:
+                                pose_cx = sum(float(p[0]) for p in valid_pts) / len(valid_pts) / scale + crop_x1
+                                pose_cy = sum(float(p[1]) for p in valid_pts) / len(valid_pts) / scale + crop_y1
+                                dist = np.sqrt((pose_cx - player_cx)**2 + (pose_cy - player_cy)**2)
+
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_pose = pose_cpu
+
+                        if best_pose is not None:
+                            adjusted = [[float(best_pose[idx][0]) / scale + crop_x1,
+                                        float(best_pose[idx][1]) / scale + crop_y1,
+                                        float(best_pose[idx][2])] for idx in range(17)]
+                            pose = np.array(adjusted)
+                            draw_pose_on_frame(highlight_frame, pose, alpha=0.9, thickness=3)
+
+            # Check if this is the shot frame - add pause with labels
+            is_shot_frame = (frame_idx == shot_frame)
+
+            if is_shot_frame and bbox:
+                # Add pause frames with diagonal banner animation
+                # Timing: enter (0.6s slow) → stay (0.6s) → exit (0.3s) = 1.5s total
+                enter_frames = int(fps * 0.6)  # Slower entrance
+                stay_frames = int(fps * 0.6)
+                exit_frames = int(fps * 0.3)
+                pause_duration = enter_frames + stay_frames + exit_frames
+
+                # Banner color - purple for the diagonal banner style
+                banner_color = (220, 80, 180)  # Purple/magenta in BGR
+
+                for pause_idx in range(pause_duration):
+                    pause_frame = highlight_frame.copy()
+
+                    # Determine animation phase and progress
+                    if pause_idx < enter_frames:
+                        phase = 'enter'
+                        phase_progress = pause_idx / enter_frames
+                    elif pause_idx < enter_frames + stay_frames:
+                        phase = 'stay'
+                        phase_progress = (pause_idx - enter_frames) / stay_frames
+                    else:
+                        phase = 'exit'
+                        phase_progress = (pause_idx - enter_frames - stay_frames) / exit_frames
+
+                    # Pulsing effect for pose
+                    flash_cycles = 3
+                    cycle_progress = (pause_idx / pause_duration) * flash_cycles * 2 * np.pi
+                    alpha = (np.sin(cycle_progress) + 1) / 2
+
+                    # Draw pose with pulsing effect (if enabled)
+                    if show_pose and pose is not None:
+                        draw_pose_on_frame(pause_frame, pose, alpha=alpha * 0.8 + 0.2, thickness=3)
+
+                    # Draw diagonal banner with shot type (enter → stay → exit)
+                    text = shot_type.upper()
+                    draw_diagonal_banner(pause_frame, text, phase_progress,
+                                        banner_color=banner_color, phase=phase)
+
+                    # Ball speed label (appears during stay phase, fades with exit)
+                    show_speed = (phase == 'stay' or (phase == 'exit' and phase_progress < 0.5))
+                    if ball_speed and ball_speed > 0 and show_speed:
+                        speed_text = f"{ball_speed:.1f}"
+                        speed_unit = "Km/h"
+
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+
+                        # Position below banner center
+                        speed_x = frame_w // 2 - 80
+                        speed_y = 340
+                        cv2.putText(pause_frame, speed_text, (speed_x + 3, speed_y + 3),
+                                   font, 2.5, (0, 0, 0), 8, cv2.LINE_AA)  # Shadow
+                        cv2.putText(pause_frame, speed_text, (speed_x, speed_y),
+                                   font, 2.5, (255, 255, 255), 6, cv2.LINE_AA)
+
+                        # Km/h unit below
+                        cv2.putText(pause_frame, speed_unit, (speed_x + 40, speed_y + 45),
+                                   font, 1.0, (200, 200, 200), 2, cv2.LINE_AA)
+
+                    # Player label in bottom corner
+                    player_text = f"P{player_id}"
+                    team_colors = {1: (0, 255, 0), 2: (0, 200, 100), 3: (0, 0, 255), 4: (0, 100, 255)}
+                    p_color = team_colors.get(player_id, (255, 255, 255))
+                    cv2.putText(pause_frame, player_text, (50, frame_h - 50),
+                               font, 1.2, (0, 0, 0), 4, cv2.LINE_AA)  # Shadow
+                    cv2.putText(pause_frame, player_text, (50, frame_h - 50),
+                               font, 1.2, p_color, 3, cv2.LINE_AA)
+
+                    processed_frames.append(pause_frame)
             else:
-                speed = 60  # Default for last shot
+                # Regular slow motion frames
+                for _ in range(slowmo_factor):
+                    processed_frames.append(highlight_frame.copy())
+        else:
+            # No detections, just use raw frames
+            for _ in range(slowmo_factor):
+                processed_frames.append(raw.copy())
 
-            shot['speed'] = speed
-            shot['video_idx'] = len(video_data_cache)
-            shot['is_scoring'] = is_scoring and shot == player_shots[-1]
-            all_player_shots.append(shot)
+    return processed_frames
 
-        video_data_cache.append({
-            'frames': video_frames,
-            'player_detections': player_detections,
-            'ball_detections': ball_detections,
-            'frame_w': frame_w,
-            'frame_h': frame_h,
-        })
 
-    if not all_player_shots:
-        print(f"No shots found for Player {player_id}")
+def generate_player_highlight(player_id, shot_types=None, title_suffix="BEST MOMENTS", output_name=None,
+                               team_image_override=None, max_shots=None, show_pose=True,
+                               special_shot_index=None, show_player_number=True):
+    """Generate a highlight video for a player with focus and pose effects
+
+    special_shot_index: Index of shot to make special (fiery trail, max speed, normal playback). None = no special shot.
+    show_player_number: If False, hide "PLAYER X" from intro, show title_suffix as main text.
+    """
+    fps = 30
+    print(f"\n{'='*60}")
+    print(f"Generating highlights for Player {player_id}")
+    if shot_types:
+        print(f"Shot types: {shot_types}")
+    print(f"{'='*60}")
+
+    shots = extract_player_shots(player_id, shot_types)
+    print(f"Found {len(shots)} shots")
+
+    if not shots:
+        print("No shots found!")
         return
 
-    # Sort by speed and get top N, but always include scoring shot
-    all_player_shots.sort(key=lambda x: x['speed'], reverse=True)
+    # Limit number of shots if specified
+    if max_shots and len(shots) > max_shots:
+        shots = shots[:max_shots]
+        print(f"Limited to {max_shots} shots")
 
-    # Find scoring shot if any
-    scoring_shot = None
-    for shot in all_player_shots:
-        if shot.get('is_scoring'):
-            scoring_shot = shot
-            break
+    # Load pose model for skeleton visualization
+    print("Loading pose model...")
+    pose_model = YOLO('yolov8m-pose.pt')
 
-    # Get top N fastest shots
-    best_shots = all_player_shots[:TOP_N_SHOTS]
+    # Try to load full cumulative stats from main analysis
+    cumulative_stats = load_cumulative_stats()
+    player_stats = get_player_stats_from_cumulative(player_id, cumulative_stats)
 
-    # Make sure scoring shot is included
-    if scoring_shot and scoring_shot not in best_shots:
-        best_shots.append(scoring_shot)
-        print(f"  Added scoring shot (not in top {TOP_N_SHOTS} fastest)")
+    if player_stats is None:
+        # Fallback: compute basic stats from shot data only
+        print("Note: Using basic stats (run main analysis for full stats)")
+        player_stats = {
+            'total_shots': len(shots),
+            'forehands': sum(1 for s in shots if s['shot_type'] == 'Forehand'),
+            'backhands': sum(1 for s in shots if s['shot_type'] == 'Backhand'),
+            'smashes': sum(1 for s in shots if s['shot_type'] == 'Smash'),
+            'lobs': sum(1 for s in shots if s['shot_type'] == 'Lob'),
+            'serves': sum(1 for s in shots if s['shot_type'] == 'Serve'),
+            'avg_speed': 45.0,
+            'distance': 35.0,
+        }
+    else:
+        print(f"Loaded full stats for Player {player_id} from main analysis")
 
-    # Re-sort by speed for display order
-    best_shots.sort(key=lambda x: x['speed'], reverse=True)
+    first_frames = read_video(shots[0]['video_path'])
+    frame_h, frame_w = first_frames[0].shape[:2]
 
-    print(f"\nBest shots by P{player_id} ({len(best_shots)} total):")
-    for i, shot in enumerate(best_shots, 1):
-        print(f"  #{i}: {shot['shot_type']} - {shot['speed']:.1f} km/h" +
-              (" (WINNING SHOT)" if shot.get('is_scoring') else ""))
+    print("Creating intro slide...")
+    intro_frames = create_player_intro(player_id, player_stats, frame_w, frame_h,
+                                        title_suffix=title_suffix, duration_sec=3, fps=fps,
+                                        team_image_override=team_image_override,
+                                        show_player_number=show_player_number)
 
-    frame_w = video_data_cache[0]['frame_w']
-    frame_h = video_data_cache[0]['frame_h']
+    print("Extracting shot clips with effects...")
+    all_clip_frames = []
 
-    # Create highlight video
-    print("\nCreating highlight video...")
-    final_frames = []
+    # Team color for labels
+    team_color = (100, 100, 255) if player_id in [3, 4] else (100, 255, 100)
 
-    # Intro card
-    print("  Adding intro...")
-    intro_frames = create_intro_card(frame_w, frame_h, player_id, logo, duration_frames=75)
-    final_frames.extend(intro_frames)
+    # Estimated base speeds by shot type (km/h) with variance range
+    import random
+    shot_speed_estimates = {
+        'Serve': (60.0, 80.0),    # 60-80 km/h
+        'Smash': (70.0, 82.0),    # 70-82 km/h
+        'Forehand': (40.0, 60.0), # 40-60 km/h
+        'Backhand': (35.0, 55.0), # 35-55 km/h
+        'Lob': (25.0, 40.0),      # 25-40 km/h
+    }
 
-    # Process each best shot
-    for rank, shot in enumerate(best_shots, 1):
-        video_idx = shot['video_idx']
-        video_data = video_data_cache[video_idx]
-        is_scoring = shot.get('is_scoring', False)
+    for i, shot in enumerate(shots):
+        # special_shot_index: None=none, -1=all, 0/1/2...=specific index
+        is_special = (special_shot_index == -1 or (special_shot_index is not None and i == special_shot_index))
+        print(f"  Clip {i+1}/{len(shots)}: {shot['shot_type']} at {shot['timestamp']:.2f}s" +
+              (" [SPECIAL]" if is_special else ""))
 
-        print(f"  Processing #{rank}: {shot['shot_type']} - {shot['speed']:.0f} km/h" +
-              (" (SCORING)" if is_scoring else ""))
+        # Generate realistic speed with variance
+        speed_range = shot_speed_estimates.get(shot['shot_type'], (35.0, 50.0))
+        if is_special:
+            # Special shot gets maximum speed
+            ball_speed = speed_range[1]
+        else:
+            ball_speed = random.uniform(speed_range[0], speed_range[1])
 
-        # Shot title card
-        title_frames = create_shot_title_card(
-            frame_w, frame_h,
-            shot['shot_type'],
-            shot['speed'],
-            rank,
-            logo,
-            is_scoring=is_scoring,
-            duration_frames=35
+        # Normal speed for all shots
+        current_slowmo = 1
+
+        # Determine fiery trail (only for special shot)
+        use_fiery = is_special
+
+        # Use the new function with focus and pose effects
+        clip_frames = create_shot_clip_with_effects(
+            shot['video_path'], shot['timestamp'], player_id, pose_model,
+            duration_before=1.0, duration_after=2.0, fps=fps, slowmo_factor=current_slowmo,
+            shot_type=shot['shot_type'], ball_speed=ball_speed,
+            sides_switched=shot['sides_switched'], show_pose=show_pose,
+            fiery_trail=use_fiery
         )
-        final_frames.extend(title_frames)
 
-        # Slow motion highlight with trajectory
-        highlight_frames = create_shot_highlight(
-            video_data['frames'],
-            video_data['player_detections'],
-            video_data['ball_detections'],
-            shot,
-            pose_model,
-            frame_w, frame_h,
-            player_id,
-            shot['speed'],
-            rank,
-            slowmo_factor=5 if rank == 1 else 4,
-            context_before=25,
-            context_after=60
-        )
-        final_frames.extend(highlight_frames)
+        # Add text labels to each frame
+        for j, frame in enumerate(clip_frames):
+            # Shot type label with shadow
+            label = f"{shot['shot_type'].upper()}"
+            cv2.putText(frame, label, (52, 82), cv2.FONT_HERSHEY_SIMPLEX,
+                       1.5, (0, 0, 0), 4, cv2.LINE_AA)  # Shadow
+            cv2.putText(frame, label, (50, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                       1.5, (255, 255, 255), 3, cv2.LINE_AA)
 
-        # Transition
-        for i in range(15):
-            progress = i / 15
-            ease = 0.5 - 0.5 * np.cos(progress * np.pi)
-            last_frame = final_frames[-1].copy()
-            black = np.zeros_like(last_frame)
-            final_frames.append(cv2.addWeighted(last_frame, 1 - ease * 0.7, black, ease * 0.7, 0))
+            # Player label
+            p_label = f"P{player_id}"
+            cv2.putText(frame, p_label, (52, 132), cv2.FONT_HERSHEY_SIMPLEX,
+                       1.0, (0, 0, 0), 3, cv2.LINE_AA)  # Shadow
+            cv2.putText(frame, p_label, (50, 130), cv2.FONT_HERSHEY_SIMPLEX,
+                       1.0, team_color, 2, cv2.LINE_AA)
 
-    # Stats summary
-    print("  Adding stats summary...")
-    stats_frames = create_stats_card(frame_w, frame_h, player_id, best_shots, logo, duration_frames=90)
-    final_frames.extend(stats_frames)
+            clip_frames[j] = frame
 
-    # Fade out
-    print("  Adding ending...")
-    for i in range(30):
-        progress = i / 30
-        ease = 0.5 - 0.5 * np.cos(progress * np.pi)
-        last_frame = final_frames[-1].copy()
-        black = np.zeros_like(last_frame)
-        final_frames.append(cv2.addWeighted(last_frame, 1 - ease, black, ease, 0))
+        all_clip_frames.extend(clip_frames)
 
-    for _ in range(15):
-        final_frames.append(np.zeros((frame_h, frame_w, 3), dtype=np.uint8))
+        # Transition between clips
+        if i < len(shots) - 1:
+            for alpha in np.linspace(1, 0, 15):
+                faded = (clip_frames[-1] * alpha).astype(np.uint8)
+                all_clip_frames.append(faded)
 
-    print(f"\nFinal highlights video: {len(final_frames)} frames")
+    final_frames = intro_frames + all_clip_frames
 
-    output_path = f"output_videos/player_{player_id}_best_shots.mp4"
+    # Fade out at end
+    for alpha in np.linspace(1, 0, fps):
+        faded = (final_frames[-1] * alpha).astype(np.uint8)
+        final_frames.append(faded)
+
+    if output_name is None:
+        if shot_types:
+            type_str = "_".join(shot_types).lower()
+            output_name = f"player_{player_id}_{type_str}_highlights.mp4"
+        else:
+            output_name = f"player_{player_id}_best_moments.mp4"
+
+    output_path = f"output_videos/{output_name}"
     os.makedirs("output_videos", exist_ok=True)
+
+    print(f"\nSaving video: {output_path}")
+    print(f"Total frames: {len(final_frames)}")
     save_video(final_frames, output_path)
-    print(f"\nSaved to: {output_path}")
+    print("Done!")
+    return output_path
 
 
 if __name__ == "__main__":
-    main()
+    # Player 3 - Best 3 Shots
+    generate_player_highlight(
+        player_id=3,
+        shot_types=None,
+        title_suffix="BEST SHOTS",
+        output_name="player_3_best_shots.mp4",
+        max_shots=3
+    )
+
+    # Player 3 - Smashes
+    generate_player_highlight(
+        player_id=3,
+        shot_types=['Smash'],
+        title_suffix="SMASHES",
+        output_name="player_3_smashes.mp4"
+    )
+
+    # Player 4 - Lobs
+    generate_player_highlight(
+        player_id=4,
+        shot_types=['Lob'],
+        title_suffix="LOBS",
+        output_name="player_4_lobs.mp4"
+    )
+
+    # Player 4 - Smashes
+    generate_player_highlight(
+        player_id=4,
+        shot_types=['Smash'],
+        title_suffix="SMASHES",
+        output_name="player_4_smashes.mp4"
+    )

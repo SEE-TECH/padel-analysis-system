@@ -45,6 +45,29 @@ VIDEO_CONFIGS = [
         'winning_reason': "Ball bounced out",
         'highlight_players': [3],  # Players to highlight in replay
     },
+    {
+        'video_path': 'inputs/video_4.mp4',
+        'shot_data_path': 'shot_data_video_4.csv',
+        'sides_switched': False,  # Green team (P1,P2) near, Red team (P3,P4) far
+        'score_team1': 15,  # Score after video_3: 15-15
+        'score_team2': 15,
+        'point_winner': 2,  # Team 2 wins this point
+        'winning_reason': "Unforced Error - Net",
+        'highlight_players': [4, 2],  # Focus on P4 and P2
+        'highlight_start_time': 17.900,  # Start highlight from P4's forehand
+        'hide_ball_tracking': True,  # Hide ball tracking in this video
+    },
+    {
+        'video_path': 'inputs/video_5.mp4',
+        'shot_data_path': 'shot_data_video_5.csv',
+        'sides_switched': True,  # Red team (P3,P4) near, Green team (P1,P2) far
+        'score_team1': 15,  # Score after video_4: 15-30
+        'score_team2': 30,
+        'point_winner': 1,  # Team 1 wins this point
+        'winning_reason': "Ball hit wall directly",
+        'highlight_players': [4],  # Focus on P4's error
+        'hide_ball_tracking': True,  # Hide ball tracking in this video
+    },
 ]
 
 # ============================================================================
@@ -348,6 +371,13 @@ def process_video(video_config, cumulative_stats, pose_model, fps=30):
             current_stats[f'player_{pid}_last_shot_speed'] = 0
             current_stats[f'player_{pid}_total_player_speed'] = 0
             current_stats[f'player_{pid}_last_player_speed'] = 0
+            current_stats[f'player_{pid}_lobs_before_line'] = 0
+            current_stats[f'player_{pid}_lobs_behind_line'] = 0
+            current_stats[f'player_{pid}_serve_breaks'] = 0
+            current_stats[f'player_{pid}_unforced_errors'] = 0
+            current_stats[f'player_{pid}_total_distance'] = 0
+            current_stats[f'player_{pid}_1st_serve_won'] = 0
+            current_stats[f'player_{pid}_2nd_serve_won'] = 0
             for st in shot_types:
                 current_stats[f'player_{pid}_{st.lower()}'] = 0
         for st in shot_types:
@@ -367,36 +397,81 @@ def process_video(video_config, cumulative_stats, pose_model, fps=30):
         team1_players = [1, 2]  # Green team (near side)
         team2_players = [3, 4]  # Red team (far side)
 
-    # Process shots
-    for i in range(len(shot_data) - 1):
+    # Process shots (all shots including last one)
+    for i in range(len(shot_data)):
         start_frame = shot_data[i]['frame']
-        end_frame = shot_data[i + 1]['frame']
-        ball_shot_time = (end_frame - start_frame) / fps
-
-        if 1 not in ball_mini_court_detections[start_frame] or 1 not in ball_mini_court_detections[end_frame]:
-            continue
-
-        dist_pixels = measure_distance(ball_mini_court_detections[start_frame][1],
-                                       ball_mini_court_detections[end_frame][1])
-        dist_meters = convert_pixel_distance_to_meters(dist_pixels, constants.DOUBLE_LINE_WIDTH,
-                                                       mini_court.get_width_of_mini_court())
-        speed = dist_meters / ball_shot_time * 3.6
-
         player_shot_ball = shot_data[i]['player_id']
         shot_type = shot_data[i].get('shot_type', 'Forehand')
         opponent_players = team2_players if player_shot_ball in team1_players else team1_players
 
+        # Calculate speed only if there's a next shot
+        speed = 0
+        if i < len(shot_data) - 1:
+            end_frame = shot_data[i + 1]['frame']
+            ball_shot_time = (end_frame - start_frame) / fps
+
+            if 1 in ball_mini_court_detections[start_frame] and 1 in ball_mini_court_detections[end_frame]:
+                dist_pixels = measure_distance(ball_mini_court_detections[start_frame][1],
+                                               ball_mini_court_detections[end_frame][1])
+                dist_meters = convert_pixel_distance_to_meters(dist_pixels, constants.DOUBLE_LINE_WIDTH,
+                                                               mini_court.get_width_of_mini_court())
+                speed = dist_meters / ball_shot_time * 3.6
+
+        # Store speed in shot_data for later use
+        shot_data[i]['speed'] = speed
+
         frame_stats = deepcopy(player_stats_data[-1])
         frame_stats['frame_num'] = start_frame
         frame_stats[f'player_{player_shot_ball}_number_of_shots'] += 1
-        frame_stats[f'player_{player_shot_ball}_total_shot_speed'] += speed
-        frame_stats[f'player_{player_shot_ball}_last_shot_speed'] = speed
+        if speed > 0:
+            frame_stats[f'player_{player_shot_ball}_total_shot_speed'] += speed
+            frame_stats[f'player_{player_shot_ball}_last_shot_speed'] = speed
 
         if shot_type.lower() in ['forehand', 'backhand', 'lob', 'smash', 'serve']:
             frame_stats[f'player_{player_shot_ball}_{shot_type.lower()}'] += 1
-            if speed > frame_stats[f'best_{shot_type.lower()}_speed']:
+            if speed > 0 and speed > frame_stats[f'best_{shot_type.lower()}_speed']:
                 frame_stats[f'best_{shot_type.lower()}_speed'] = speed
                 frame_stats[f'best_{shot_type.lower()}_player'] = player_shot_ball
+
+        # Classify lob position relative to service line
+        if shot_type.lower() == 'lob' and player_shot_ball in player_mini_court_detections[start_frame]:
+            player_pos = player_mini_court_detections[start_frame][player_shot_ball]
+            player_y = player_pos[1]
+
+            # Calculate service line Y positions on mini court
+            service_line_dist_pixels = mini_court.convert_meters_to_pixels(constants.SERVICE_LINE_DISTANCE)
+            near_service_y = mini_court.court_end_y - service_line_dist_pixels
+            far_service_y = mini_court.court_start_y + service_line_dist_pixels
+
+            # Determine which side the player is on
+            if sides_switched:
+                # P1, P2 are far (low Y), P3, P4 are near (high Y)
+                if player_shot_ball in [1, 2]:
+                    # Far side: before line = closer to net = higher Y
+                    if player_y > far_service_y:
+                        frame_stats[f'player_{player_shot_ball}_lobs_before_line'] += 1
+                    else:
+                        frame_stats[f'player_{player_shot_ball}_lobs_behind_line'] += 1
+                else:
+                    # Near side: before line = closer to net = lower Y
+                    if player_y < near_service_y:
+                        frame_stats[f'player_{player_shot_ball}_lobs_before_line'] += 1
+                    else:
+                        frame_stats[f'player_{player_shot_ball}_lobs_behind_line'] += 1
+            else:
+                # P1, P2 are near (high Y), P3, P4 are far (low Y)
+                if player_shot_ball in [1, 2]:
+                    # Near side: before line = closer to net = lower Y
+                    if player_y < near_service_y:
+                        frame_stats[f'player_{player_shot_ball}_lobs_before_line'] += 1
+                    else:
+                        frame_stats[f'player_{player_shot_ball}_lobs_behind_line'] += 1
+                else:
+                    # Far side: before line = closer to net = higher Y
+                    if player_y > far_service_y:
+                        frame_stats[f'player_{player_shot_ball}_lobs_before_line'] += 1
+                    else:
+                        frame_stats[f'player_{player_shot_ball}_lobs_behind_line'] += 1
 
         for opp_id in opponent_players:
             if opp_id in player_mini_court_detections[start_frame] and opp_id in player_mini_court_detections[end_frame]:
@@ -439,7 +514,8 @@ def process_video(video_config, cumulative_stats, pose_model, fps=30):
     player_avg_speed_arr = {pid: [] for pid in [1, 2, 3, 4]}
     player_top_speed_arr = {pid: [] for pid in [1, 2, 3, 4]}
 
-    player_total_dist = {pid: 0 for pid in [1, 2, 3, 4]}
+    # Initialize from cumulative stats to accumulate across videos
+    player_total_dist = {pid: current_stats.get(f'player_{pid}_total_distance', 0) for pid in [1, 2, 3, 4]}
     player_zones = {pid: {'baseline': 0, 'midcourt': 0, 'net': 0} for pid in [1, 2, 3, 4]}
     player_speeds = {pid: [] for pid in [1, 2, 3, 4]}
     player_top_speed = {pid: 0 for pid in [1, 2, 3, 4]}
@@ -538,7 +614,8 @@ def process_video(video_config, cumulative_stats, pose_model, fps=30):
     # Draw visualizations
     print("\nDrawing visualizations...")
     output_frames = player_tracker.draw_bboxes(video_frames, player_detections)
-    output_frames = ball_tracker.draw_bboxes(output_frames, ball_detections, shot_frames)
+    if not video_config.get('hide_ball_tracking', False):
+        output_frames = ball_tracker.draw_bboxes(output_frames, ball_detections, shot_frames)
     output_frames = court_line_detector.draw_keypoints_on_video(output_frames, court_keypoints)
     output_frames = mini_court.draw_mini_court_with_live_heatmap(
         output_frames, player_mini_court_detections, ball_mini_court_detections,
@@ -644,6 +721,50 @@ def process_video(video_config, cumulative_stats, pose_model, fps=30):
     # Get final cumulative stats
     final_stats = player_stats_data[-1] if player_stats_data else current_stats
 
+    # Save accumulated distance to final stats
+    for pid in [1, 2, 3, 4]:
+        final_stats[f'player_{pid}_total_distance'] = player_total_dist[pid]
+
+    # Calculate serve breaks for this point
+    # Find who served (first "Serve" shot)
+    server_id = None
+    for shot in shot_data:
+        if shot.get('shot_type', '').lower() == 'serve':
+            server_id = shot['player_id']
+            break
+
+    if server_id is not None:
+        # Determine server's team
+        server_team = 1 if server_id in [1, 2] else 2
+        point_winner = video_config.get('point_winner', 0)
+
+        # If opposing team won, they broke serve
+        if point_winner != 0 and point_winner != server_team:
+            # Credit players on the winning team with a serve break
+            winning_players = [1, 2] if point_winner == 1 else [3, 4]
+            for pid in winning_players:
+                final_stats[f'player_{pid}_serve_breaks'] = final_stats.get(f'player_{pid}_serve_breaks', 0) + 1
+
+        # Track serve points won (1st or 2nd serve)
+        # serve_type: 1 = first serve, 2 = second serve (default: 1)
+        if point_winner == server_team:
+            serve_type = video_config.get('serve_type', 1)
+            if serve_type == 1:
+                final_stats[f'player_{server_id}_1st_serve_won'] = final_stats.get(f'player_{server_id}_1st_serve_won', 0) + 1
+            else:
+                final_stats[f'player_{server_id}_2nd_serve_won'] = final_stats.get(f'player_{server_id}_2nd_serve_won', 0) + 1
+
+    # Detect unforced errors based on winning_reason
+    # If the reason indicates an error (out, net, wall directly), the last shot player made the error
+    winning_reason = video_config.get('winning_reason', '').lower()
+    error_keywords = ['out', 'net', 'wall directly', 'double fault']
+
+    if any(keyword in winning_reason for keyword in error_keywords) and shot_data:
+        # Last shot in the rally is the error
+        last_shot = shot_data[-1]
+        error_player = last_shot['player_id']
+        final_stats[f'player_{error_player}_unforced_errors'] = final_stats.get(f'player_{error_player}_unforced_errors', 0) + 1
+
     return {
         'frames': final_frames,
         'video_frames': video_frames,
@@ -684,19 +805,28 @@ def create_replay(video_data, video_config, pose_model, logo):
     if highlight_players is None:
         highlight_players = winning_team_players
 
-    last_winning_shot = None
-    for shot in reversed(shot_data):
-        if shot['player_id'] in winning_team_players:
-            last_winning_shot = shot
-            break
+    # Check for custom highlight start time
+    custom_start_time = video_config.get('highlight_start_time', None)
 
-    if not last_winning_shot:
-        last_winning_shot = shot_data[-1] if shot_data else None
+    if custom_start_time is not None:
+        # Use custom start time (convert seconds to frame number)
+        highlight_start = int(custom_start_time * fps)
+    else:
+        # Default: find last shot by winning team
+        last_winning_shot = None
+        for shot in reversed(shot_data):
+            if shot['player_id'] in winning_team_players:
+                last_winning_shot = shot
+                break
 
-    if not last_winning_shot:
-        return []
+        if not last_winning_shot:
+            last_winning_shot = shot_data[-1] if shot_data else None
 
-    highlight_start = last_winning_shot['frame']
+        if not last_winning_shot:
+            return []
+
+        highlight_start = last_winning_shot['frame']
+
     highlight_end = len(video_frames) - 1
 
     # Prepare logos
@@ -803,7 +933,7 @@ def create_replay(video_data, video_config, pose_model, logo):
     slowmo = 4
     replay_count = 0
 
-    # Pre-compute poses for key players
+    # Pre-compute poses for key players (with proper player selection)
     highlight_poses = {}
     for pid in highlight_players:
         highlight_poses[pid] = {}
@@ -811,7 +941,11 @@ def create_replay(video_data, video_config, pose_model, logo):
             bbox = player_detections[frame_idx].get(pid)
             if bbox:
                 x1, y1, x2, y2 = bbox
-                padding = max(x2 - x1, y2 - y1) * 0.5
+                player_cx = (x1 + x2) / 2
+                player_cy = (y1 + y2) / 2
+
+                # Use tighter padding to minimize detecting other players
+                padding = max(x2 - x1, y2 - y1) * 0.35
                 crop_x1, crop_y1 = max(0, int(x1 - padding)), max(0, int(y1 - padding))
                 crop_x2, crop_y2 = min(frame_w, int(x2 + padding)), min(frame_h, int(y2 + padding))
                 cropped = video_frames[frame_idx][crop_y1:crop_y2, crop_x1:crop_x2].copy()
@@ -825,11 +959,34 @@ def create_replay(video_data, video_config, pose_model, logo):
 
                     results = pose_model(cropped, verbose=False)[0]
                     if results.keypoints is not None and len(results.keypoints.data) > 0:
-                        kpts = results.keypoints.data[0]
-                        adjusted = [[float(kpts[idx][0]) / scale + crop_x1,
-                                    float(kpts[idx][1]) / scale + crop_y1,
-                                    float(kpts[idx][2])] for idx in range(17)]
-                        highlight_poses[pid][frame_idx] = np.array(adjusted)
+                        # Select pose closest to player center
+                        best_pose = None
+                        best_dist = float('inf')
+
+                        for pose_data in results.keypoints.data:
+                            pose_cpu = pose_data.cpu().numpy() if hasattr(pose_data, 'cpu') else pose_data
+
+                            # Calculate pose center using hip or shoulder points
+                            hip_pts = [pose_cpu[11], pose_cpu[12]]
+                            valid_pts = [p for p in hip_pts if p[2] > 0.3]
+                            if not valid_pts:
+                                shoulder_pts = [pose_cpu[5], pose_cpu[6]]
+                                valid_pts = [p for p in shoulder_pts if p[2] > 0.3]
+
+                            if valid_pts:
+                                pose_cx = sum(float(p[0]) for p in valid_pts) / len(valid_pts) / scale + crop_x1
+                                pose_cy = sum(float(p[1]) for p in valid_pts) / len(valid_pts) / scale + crop_y1
+                                dist = np.sqrt((pose_cx - player_cx)**2 + (pose_cy - player_cy)**2)
+
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_pose = pose_cpu
+
+                        if best_pose is not None:
+                            adjusted = [[float(best_pose[idx][0]) / scale + crop_x1,
+                                        float(best_pose[idx][1]) / scale + crop_y1,
+                                        float(best_pose[idx][2])] for idx in range(17)]
+                            highlight_poses[pid][frame_idx] = np.array(adjusted)
 
     for frame_idx in range(highlight_start, highlight_end + 1):
         raw = video_frames[frame_idx].copy()
@@ -893,6 +1050,251 @@ def create_replay(video_data, video_config, pose_model, logo):
     return replay_frames
 
 
+def create_summary_section(cumulative_stats, frame_w, frame_h, final_score_t1, final_score_t2, logo=None, fps=30):
+    """Create professional summary section with team image, score, and player stats"""
+    summary_frames = []
+
+    # Tennis score format
+    score_map = {0: '0', 15: '15', 30: '30', 40: '40'}
+    s1 = score_map.get(final_score_t1, str(final_score_t1))
+    s2 = score_map.get(final_score_t2, str(final_score_t2))
+
+    # Player stats to display (extended stats)
+    player_stats = {}
+    for pid in [1, 2, 3, 4]:
+        shots = cumulative_stats.get(f'player_{pid}_number_of_shots', 0)
+        avg_speed = cumulative_stats.get(f'player_{pid}_total_shot_speed', 0) / max(shots, 1)
+        forehands = cumulative_stats.get(f'player_{pid}_forehand', 0)
+        backhands = cumulative_stats.get(f'player_{pid}_backhand', 0)
+        smashes = cumulative_stats.get(f'player_{pid}_smash', 0)
+        serves = cumulative_stats.get(f'player_{pid}_serve', 0)
+        unforced_errors = cumulative_stats.get(f'player_{pid}_unforced_errors', 0)
+        winners = cumulative_stats.get(f'player_{pid}_winners', 0)
+        lobs_before = cumulative_stats.get(f'player_{pid}_lobs_before_line', 0)
+        lobs_behind = cumulative_stats.get(f'player_{pid}_lobs_behind_line', 0)
+        serve1_won = cumulative_stats.get(f'player_{pid}_1st_serve_won', 0)
+        serve2_won = cumulative_stats.get(f'player_{pid}_2nd_serve_won', 0)
+        serve_breaks = cumulative_stats.get(f'player_{pid}_serve_breaks', 0)
+
+        player_stats[pid] = {
+            'Total Shots': int(shots),
+            'Avg Speed': f'{avg_speed:.1f} km/h',
+            'Forehands': int(forehands),
+            'Backhands': int(backhands),
+            'Smashes': int(smashes),
+            'Serves': int(serves),
+            'Unforced Errors': int(unforced_errors),
+            'Winners': int(winners),
+            'Lobs (Before Line)': int(lobs_before),
+            'Lobs (Behind Line)': int(lobs_behind),
+            '1st Serve Won': int(serve1_won),
+            '2nd Serve Won': int(serve2_won),
+            'Serve Breaks': int(serve_breaks),
+        }
+
+    # Load team image
+    team_img = None
+    if os.path.exists("team.png"):
+        team_img = cv2.imread("team.png", cv2.IMREAD_UNCHANGED)
+        if team_img is not None and len(team_img.shape) > 2 and team_img.shape[2] == 4:
+            team_img = team_img[:, :, :3].copy()
+
+    # Load logo at full resolution
+    logo_img = None
+    if os.path.exists("logo.png"):
+        logo_img = cv2.imread("logo.png", cv2.IMREAD_UNCHANGED)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    duration_frames = int(fps * 4)
+
+    for frame_idx in range(duration_frames):
+        progress = min(1.0, frame_idx / (fps * 0.8))
+        ease = 0.5 - 0.5 * np.cos(progress * np.pi)
+        alpha = ease
+
+        # Dark gradient background
+        frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+        for y in range(frame_h):
+            prog = y / frame_h
+            b = int(45 - prog * 25)
+            g = int(35 - prog * 20)
+            r = int(30 - prog * 15)
+            frame[y, :] = [max(b, 12), max(g, 10), max(r, 8)]
+
+        # Team image as transparent background
+        if team_img is not None:
+            img_aspect = team_img.shape[1] / team_img.shape[0]
+            frame_aspect = frame_w / frame_h
+            if img_aspect > frame_aspect:
+                img_w = frame_w
+                img_h = int(img_w / img_aspect)
+            else:
+                img_h = frame_h
+                img_w = int(img_h * img_aspect)
+            team_resized = cv2.resize(team_img, (img_w, img_h))
+            img_x = (frame_w - img_w) // 2
+            img_y = (frame_h - img_h) // 2 - 100
+            if img_y >= 0 and img_y + img_h <= frame_h:
+                opacity = 0.20 * alpha
+                roi = frame[img_y:img_y+img_h, img_x:img_x+img_w].astype(np.float32)
+                blended = roi * (1 - opacity) + team_resized.astype(np.float32) * opacity
+                frame[img_y:img_y+img_h, img_x:img_x+img_w] = blended.astype(np.uint8)
+
+        # Vignette
+        center_x, center_y = frame_w // 2, frame_h // 2
+        Y, X = np.ogrid[:frame_h, :frame_w]
+        dist = np.sqrt((X - center_x)**2 + (Y - center_y)**2)
+        max_dist = np.sqrt(center_x**2 + center_y**2)
+        vignette = 1 - (dist / max_dist) * 0.3
+        for c in range(3):
+            frame[:, :, c] = (frame[:, :, c] * vignette).astype(np.uint8)
+
+        # Title with glow
+        title = "MATCH SUMMARY"
+        title_y = 150
+        (tw, th), _ = cv2.getTextSize(title, font, 1.5, 3)
+        title_x = (frame_w - tw) // 2
+        for offset in range(3, 0, -1):
+            glow_alpha = 0.3 / offset * alpha
+            glow_color = (int(50 * glow_alpha), int(180 * glow_alpha), int(255 * glow_alpha))
+            cv2.putText(frame, title, (title_x, title_y), font, 1.5, glow_color, 3 + offset*2, cv2.LINE_AA)
+        cv2.putText(frame, title, (title_x, title_y), font, 1.5,
+                   (int(100 * alpha), int(220 * alpha), int(255 * alpha)), 3, cv2.LINE_AA)
+
+        # Scoreboard
+        sb_width, sb_height = 400, 85
+        sb_x = (frame_w - sb_width) // 2
+        sb_y = (frame_h - sb_height) // 2
+        if alpha > 0:
+            cv2.rectangle(frame, (sb_x + 4, sb_y + 4), (sb_x + sb_width + 4, sb_y + sb_height + 4), (0, 0, 0), -1)
+            cv2.rectangle(frame, (sb_x, sb_y), (sb_x + sb_width, sb_y + sb_height), (30, 30, 35), -1)
+            cv2.rectangle(frame, (sb_x, sb_y), (sb_x + sb_width//2 - 2, sb_y + 7),
+                         (int(80 * alpha), int(200 * alpha), int(80 * alpha)), -1)
+            cv2.rectangle(frame, (sb_x + sb_width//2 + 2, sb_y), (sb_x + sb_width, sb_y + 7),
+                         (int(80 * alpha), int(80 * alpha), int(200 * alpha)), -1)
+            cv2.rectangle(frame, (sb_x, sb_y), (sb_x + sb_width, sb_y + sb_height),
+                         (int(150 * alpha), int(150 * alpha), int(160 * alpha)), 2)
+            center_x_sb = sb_x + sb_width // 2
+            cv2.line(frame, (center_x_sb, sb_y + 12), (center_x_sb, sb_y + sb_height - 5),
+                    (int(100 * alpha), int(100 * alpha), int(110 * alpha)), 2)
+            cv2.putText(frame, "-", (center_x_sb - 8, sb_y + 55), font, 1.1,
+                       (int(140 * alpha), int(140 * alpha), int(150 * alpha)), 2, cv2.LINE_AA)
+            t1_center = sb_x + sb_width // 4
+            cv2.putText(frame, "TEAM 1", (t1_center - 40, sb_y + 30), font, 0.55,
+                       (int(120 * alpha), int(200 * alpha), int(120 * alpha)), 1, cv2.LINE_AA)
+            (sw1, _), _ = cv2.getTextSize(s1, font, 1.5, 3)
+            cv2.putText(frame, s1, (t1_center - sw1//2, sb_y + 68), font, 1.5,
+                       (int(255 * alpha), int(255 * alpha), int(255 * alpha)), 3, cv2.LINE_AA)
+            t2_center = sb_x + 3 * sb_width // 4
+            cv2.putText(frame, "TEAM 2", (t2_center - 40, sb_y + 30), font, 0.55,
+                       (int(120 * alpha), int(120 * alpha), int(200 * alpha)), 1, cv2.LINE_AA)
+            (sw2, _), _ = cv2.getTextSize(s2, font, 1.5, 3)
+            cv2.putText(frame, s2, (t2_center - sw2//2, sb_y + 68), font, 1.5,
+                       (int(255 * alpha), int(255 * alpha), int(255 * alpha)), 3, cv2.LINE_AA)
+
+        # Player cards
+        card_width, card_height = 290, 420
+        card_gap, team_gap = 50, 500
+        total_cards_width = card_width * 4 + card_gap * 2 + team_gap
+        cards_start_x = (frame_w - total_cards_width) // 2
+        cards_y = frame_h - card_height - 50
+
+        def draw_player_card(frm, pid, x, y, width, height, team_color, accent_color, alph):
+            for i in range(5, 0, -1):
+                cv2.rectangle(frm, (x + i, y + i), (x + width + i, y + height + i), (int(10*0.1*i), int(10*0.1*i), int(15*0.1*i)), -1)
+            overlay = frm.copy()
+            for row in range(height):
+                prog = row / height
+                shade = int(40 - prog * 12)
+                cv2.line(overlay, (x, y + row), (x + width, y + row), (shade + 8, shade + 3, shade), 1)
+            cv2.addWeighted(overlay, 0.9 * alph, frm, 1 - 0.9 * alph, 0, frm)
+            cv2.rectangle(frm, (x, y), (x + width, y + height), (int(80 * alph), int(80 * alph), int(90 * alph)), 2)
+            cv2.rectangle(frm, (x, y), (x + width, y + 5), tuple(int(c * alph) for c in accent_color), -1)
+            header_h = 42
+            header_overlay = frm.copy()
+            cv2.rectangle(header_overlay, (x + 2, y + 5), (x + width - 2, y + header_h),
+                         (int(team_color[0]*0.5*alph), int(team_color[1]*0.5*alph), int(team_color[2]*0.5*alph)), -1)
+            cv2.addWeighted(header_overlay, 0.7, frm, 0.3, 0, frm)
+            player_name = f"PLAYER {pid}"
+            (nw, _), _ = cv2.getTextSize(player_name, font, 0.8, 2)
+            cv2.putText(frm, player_name, (x + (width - nw) // 2, y + 32), font, 0.8,
+                       (int(255 * alph), int(255 * alph), int(255 * alph)), 2, cv2.LINE_AA)
+            cv2.line(frm, (x + 20, y + header_h + 8), (x + width - 20, y + header_h + 8),
+                    (int(70 * alph), int(70 * alph), int(80 * alph)), 1)
+            stats = player_stats[pid]
+            row_y = y + header_h + 28
+            row_height = 26
+            for i, (stat_name, stat_value) in enumerate(stats.items()):
+                if i % 2 == 0:
+                    row_overlay = frm.copy()
+                    cv2.rectangle(row_overlay, (x + 6, row_y - 16), (x + width - 6, row_y + 6),
+                                 (int(50 * alph), int(50 * alph), int(58 * alph)), -1)
+                    cv2.addWeighted(row_overlay, 0.5, frm, 0.5, 0, frm)
+                cv2.putText(frm, stat_name, (x + 12, row_y), font, 0.48,
+                           (int(220 * alph), int(225 * alph), int(235 * alph)), 1, cv2.LINE_AA)
+                val_str = str(stat_value)
+                (vw, _), _ = cv2.getTextSize(val_str, font, 0.55, 2)
+                if stat_name in ['Total Shots', 'Avg Speed', 'Winners', 'Unforced Errors']:
+                    cv2.putText(frm, val_str, (x + width - vw - 12, row_y), font, 0.55,
+                               tuple(int(c * alph) for c in accent_color), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(frm, val_str, (x + width - vw - 12, row_y), font, 0.55,
+                               (int(255 * alph), int(255 * alph), int(255 * alph)), 2, cv2.LINE_AA)
+                row_y += row_height
+
+        team1_color, team1_accent = (200, 180, 100), (220, 240, 120)
+        team2_color, team2_accent = (100, 100, 220), (140, 150, 255)
+        p1_x = cards_start_x
+        p2_x = cards_start_x + card_width + card_gap
+        p3_x = p2_x + card_width + team_gap
+        p4_x = p3_x + card_width + card_gap
+
+        team1_label_x = (p1_x + p2_x + card_width) // 2
+        team2_label_x = (p3_x + p4_x + card_width) // 2
+        cv2.putText(frame, "TEAM 1", (team1_label_x - 80, cards_y - 35), font, 1.2,
+                   (int(160 * alpha), int(230 * alpha), int(160 * alpha)), 3, cv2.LINE_AA)
+        cv2.putText(frame, "TEAM 2", (team2_label_x - 80, cards_y - 35), font, 1.2,
+                   (int(160 * alpha), int(160 * alpha), int(230 * alpha)), 3, cv2.LINE_AA)
+
+        draw_player_card(frame, 1, p1_x, cards_y, card_width, card_height, team1_color, team1_accent, alpha)
+        draw_player_card(frame, 2, p2_x, cards_y, card_width, card_height, team1_color, team1_accent, alpha)
+        draw_player_card(frame, 3, p3_x, cards_y, card_width, card_height, team2_color, team2_accent, alpha)
+        draw_player_card(frame, 4, p4_x, cards_y, card_width, card_height, team2_color, team2_accent, alpha)
+
+        # Logo centered above scoreboard
+        if logo_img is not None and alpha > 0:
+            logo_h = 250
+            aspect = logo_img.shape[1] / logo_img.shape[0]
+            logo_w = int(logo_h * aspect)
+            logo_resized = cv2.resize(logo_img, (logo_w, logo_h), interpolation=cv2.INTER_AREA)
+            logo_x = (frame_w - logo_w) // 2
+            logo_y_pos = sb_y - logo_h - 30
+            if logo_y_pos >= 0 and logo_resized.shape[2] == 4:
+                logo_alpha_ch = (logo_resized[:, :, 3] / 255.0) * 0.9 * alpha
+                logo_alpha_3ch = np.dstack([logo_alpha_ch] * 3)
+                logo_rgb = logo_resized[:, :, :3]
+                roi = frame[logo_y_pos:logo_y_pos+logo_h, logo_x:logo_x+logo_w].astype(np.float32)
+                blended = logo_rgb * logo_alpha_3ch + roi * (1 - logo_alpha_3ch)
+                frame[logo_y_pos:logo_y_pos+logo_h, logo_x:logo_x+logo_w] = blended.astype(np.uint8)
+
+        summary_frames.append(frame)
+
+    # Hold for 2 seconds
+    for _ in range(int(fps * 2)):
+        summary_frames.append(summary_frames[-1].copy())
+
+    # Fade out
+    last_frame = summary_frames[-1].copy()
+    for i in range(int(fps * 1)):
+        progress = i / (fps * 1)
+        ease = 0.5 - 0.5 * np.cos(progress * np.pi)
+        black = np.zeros_like(last_frame)
+        faded = cv2.addWeighted(last_frame, 1 - ease, black, ease, 0)
+        summary_frames.append(faded)
+
+    return summary_frames
+
+
 def main():
     fps = 30
 
@@ -908,6 +1310,7 @@ def main():
 
     all_frames = []
     cumulative_stats = None
+    all_shot_speeds = {}  # Store shot speeds by video
 
     for i, video_config in enumerate(VIDEO_CONFIGS):
         print(f"\n\n{'#'*60}")
@@ -923,12 +1326,64 @@ def main():
         # Update cumulative stats
         cumulative_stats = video_data['cumulative_stats']
 
+        # Store shot speeds for this video
+        video_path = video_config['video_path']
+        shot_data = video_data['shot_data']
+        all_shot_speeds[video_path] = [
+            {
+                'timestamp': shot['frame'] / fps,  # Convert frame to timestamp
+                'player_id': shot['player_id'],
+                'shot_type': shot.get('shot_type', 'Unknown'),
+                'speed': shot.get('speed', 0)
+            }
+            for shot in shot_data
+        ]
+
         # Create and add replay
         print("\nCreating replay...")
         replay_frames = create_replay(video_data, video_config, pose_model, logo)
         all_frames.extend(replay_frames)
 
+    # Calculate final score based on all points
+    final_score_t1 = 0
+    final_score_t2 = 0
+    score_progression = [0, 15, 30, 40]  # Tennis scoring
+
+    for video_config in VIDEO_CONFIGS:
+        if video_config['point_winner'] == 1:
+            idx = score_progression.index(final_score_t1) if final_score_t1 in score_progression else len(score_progression) - 1
+            if idx < len(score_progression) - 1:
+                final_score_t1 = score_progression[idx + 1]
+        else:
+            idx = score_progression.index(final_score_t2) if final_score_t2 in score_progression else len(score_progression) - 1
+            if idx < len(score_progression) - 1:
+                final_score_t2 = score_progression[idx + 1]
+
+    print(f"\nFinal Score: Team 1 ({final_score_t1}) - Team 2 ({final_score_t2})")
+
+    # Add summary section
+    print("\nCreating match summary...")
+    frame_h, frame_w = all_frames[0].shape[:2]
+    summary_frames = create_summary_section(
+        cumulative_stats, frame_w, frame_h,
+        final_score_t1, final_score_t2, logo, fps
+    )
+    all_frames.extend(summary_frames)
+    print(f"Added {len(summary_frames)} summary frames")
+
     print(f"\n\nFinal combined video: {len(all_frames)} frames")
+
+    # Save cumulative stats for use by other tools (e.g., player highlights)
+    stats_path = "tracker_stubs/cumulative_stats.pkl"
+    with open(stats_path, 'wb') as f:
+        pickle.dump(cumulative_stats, f)
+    print(f"Saved cumulative stats to: {stats_path}")
+
+    # Save shot speeds for use by player highlights
+    speeds_path = "tracker_stubs/shot_speeds.pkl"
+    with open(speeds_path, 'wb') as f:
+        pickle.dump(all_shot_speeds, f)
+    print(f"Saved shot speeds to: {speeds_path}")
 
     # Save
     output_path = "output_videos/multi_video_analysis.mp4"
